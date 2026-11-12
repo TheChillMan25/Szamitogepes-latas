@@ -269,9 +269,13 @@ class StereoCameras:
             self.captures.append(capture)
 
     def read(self):
+        # Grab both frames before decoding either one to reduce the time offset.
+        for index, capture in enumerate(self.captures, start=1):
+            if not capture.grab():
+                return None, None, f"Camera {index} did not provide a frame."
         frames = []
         for index, capture in enumerate(self.captures, start=1):
-            success, frame = capture.read()
+            success, frame = capture.retrieve()
             if not success or frame is None:
                 return None, None, f"Camera {index} did not provide a frame."
             frames.append(frame)
@@ -682,13 +686,13 @@ class VirtualPointerWindow(QMainWindow):
         self.calibration = calibration
         self.board_size = board_size
         self.marker_size = marker_size
-        self.scene = MockStereoScene(calibration, board_size)
+        self.scene = MockStereoScene(calibration, board_size) if cameras is None else None
         self.cameras = cameras
         self.hands_detectors = hands_detectors
         self.board_pose_estimator = board_pose_estimator
         self.input_status = input_status
         self.kalman = KalmanFilter2D()
-        self.board_geometry = self.scene.board_geometry
+        self.board_geometry = self.scene.board_geometry if self.scene is not None else None
         self.screen_geometry = screen.geometry()
         self.laser_overlay = laser_overlay
         self.setWindowTitle("Virtual Pointer | Stereo Demo")
@@ -810,7 +814,11 @@ class VirtualPointerWindow(QMainWindow):
                 resolution,
             )
             position = self.kalman.update(*raw_position)
-            self.laser_overlay.set_position(position)
+            overlay_geometry = self.laser_overlay.geometry()
+            self.laser_overlay.set_position((
+                position[0] + self.screen_geometry.x() - overlay_geometry.x(),
+                position[1] + self.screen_geometry.y() - overlay_geometry.y(),
+            ))
             self.status.setText(
                 f"{self.input_status}  |  {position[0]}, {position[1]} px  |  "
                 f"Laser overlay on {self.screen_geometry.width()} x "
@@ -840,6 +848,18 @@ def main():
         "--mock",
         action="store_true",
         help="Use synthetic camera feeds instead of live cameras.",
+    )
+    parser.add_argument(
+        "--calibration",
+        type=Path,
+        default=Path(__file__).with_name("calibration_params.json"),
+        help="Measured stereo calibration JSON (default: calibration_params.json).",
+    )
+    parser.add_argument(
+        "--screen",
+        type=int,
+        default=0,
+        help="Target display index in Qt screen order (default: 0).",
     )
     parser.add_argument(
         "--board-width-mm",
@@ -888,16 +908,28 @@ def main():
             return value
 
     application = QApplication([sys.argv[0]])
-    screen = application.primaryScreen()
-    if screen is None:
+    screens = application.screens()
+    if not screens:
         raise RuntimeError("No display is available for the laser-pointer overlay.")
-    calibration_path = Path(__file__).with_name("calibration_params.json")
-    try:
-        calibration = load_stereo_calibration(calibration_path)
-        calibration_label = f"Calibration: {calibration_path.name}"
-    except FileNotFoundError:
+    if not 0 <= args.screen < len(screens):
+        parser.error(f"Screen index must be between 0 and {len(screens) - 1}.")
+    screen = screens[args.screen]
+    desktop_geometry = screens[0].geometry()
+    for other_screen in screens[1:]:
+        desktop_geometry = desktop_geometry.united(other_screen.geometry())
+    if args.mock:
         calibration = mock_stereo_calibration()
-        calibration_label = "Built-in mock calibration (file not found)"
+        calibration_label = "Built-in mock calibration"
+    else:
+        try:
+            with args.calibration.open("r", encoding="utf-8") as calibration_file:
+                metadata = json.load(calibration_file)
+            if metadata.get("calibration_type") != "measured":
+                raise ValueError("Calibration must be measured with stereo_calibrate.py.")
+            calibration = load_stereo_calibration(args.calibration)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+            parser.error(f"Cannot use live cameras: {error}. Run stereo_calibrate.py first, or use --mock.")
+        calibration_label = f"Calibration: {args.calibration.name}"
 
     cameras = None
     hands_detectors = (None, None)
@@ -915,20 +947,20 @@ def main():
             detector1, detector_error1 = create_hands_detector()
             detector2, detector_error2 = create_hands_detector()
             hands_detectors = (detector1, detector2)
+            if detector1 is None or detector2 is None:
+                raise RuntimeError(detector_error1 or detector_error2 or "Hand tracking unavailable")
             input_status = f"LIVE CAMERAS ({args.camera1}, {args.camera2})"
-            detector_errors = [
-                message for message in (detector_error1, detector_error2) if message
-            ]
-            if detector_errors:
-                input_status += "  |  " + "; ".join(dict.fromkeys(detector_errors))
         except (OSError, RuntimeError, ValueError) as error:
             if cameras is not None:
                 cameras.release()
                 cameras = None
-            input_status = f"MOCK CAMERAS (live open failed: {error})"
+            for detector in hands_detectors:
+                if detector is not None:
+                    detector.close()
+            parser.error(f"Cannot start live cameras: {error}. Use --mock for the demo.")
 
     laser_overlay = LaserOverlay()
-    laser_overlay.setGeometry(screen.geometry())
+    laser_overlay.setGeometry(desktop_geometry)
     laser_overlay.show()
     window = VirtualPointerWindow(
         calibration,
