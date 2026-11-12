@@ -1,0 +1,161 @@
+Virtual Pointer – projektötlet / megvalósítási terv
+A feladat lényege:
+A cél egy olyan rendszer készítése, amelyben az előadó mutatóujjának iránya alapján meghatározza, hogy a kivetítő/tábla melyik pontjára mutat, majd oda egy virtuális pointert rajzol.
+A pointer ne csak a saját programunkban jelenjen meg, hanem egy Windows-os overlayként, ezzel mindenhol látható legyen.
+A fő ötlet:
+2 kamera → kéz/ujj felismerése → 3D irány meghatározása → tábla síkjával való metszés → pointer pozíció → Windows overlay
+Elhelyezés:
+-Nagyjából tölcsért formálva VAGY az egyik nagyobb szögben, oldalról.
+Szoftverstack
+Python, OpenCV, NumPy, MediaPipe (https://mediapipe.readthedocs.io/en/latest/solutions/hands.html)
+PySide6 / Qt
+https://doc.qt.io/qtforpython-6/
+https://doc.qt.io/qtforpython-6.8/PySide6/QtWidgets/QWidget.html
+Kalman filter
+Kapcsolódó Kató Zoltán anyagok
+1. Camera Geometry
+https://www.inf.u-szeged.hu/~kato/teaching/computervision/02-CameraGeometry.pdf
+A pinhole kamera, perspektív projekció, fókusztávolság, látómező és 3D → 2D projekció alapjai.
+→ Ez kell ahhoz, hogy értsük, hogyan keletkezik a kamera képéből a térbeli információ.
+2. Camera Calibration
+https://www.inf.u-szeged.hu/~kato/teaching/computervision/03-CameraCalibration.pdf
+Belső/külső kamera-paraméterek, projekciós mátrix, pont megfeleltetések, DLT és SVD.
+→ Ezzel kalibráljuk a két kamerát.
+3. Stereo
+https://www.inf.u-szeged.hu/~kato/teaching/computervision/05-Stereo.pdf
+Két kamerából történő 3D rekonstrukció, megfeleltetés és trianguláció.
+→ Ez adja a két kamerás rendszer geometriai alapját.
+4. Tracking
+https://www.inf.u-szeged.hu/~kato/teaching/computervision/09-Tracking.pdf
+Képpontok/objektumok követése videóban, KLT, Kalman filter stb.
+→ Ezt használjuk a pointer stabilizálásához és adott esetben a kéz követéséhez.
+Teljes anyag: https://www.inf.u-szeged.hu/~kato/teaching/computervision/SzamitogepesLatas.pdf
+
+A kamerák kalibrációja, az R és T paraméterek meghatározása
+Cél: A két kamera belső optikai paramétereinek, lencsetorzításának és egymáshoz viszonyított térbeli helyzetének
+meghatározása. Bemenet: Szinkronizált képpárok egy mozgatott sakktábláról (Xi ↔ xi). Kimenet: K1, K2 belső mátrixok, D1, D2 torzítási vektorok, R, T relatív transzformáció, valamint a P1, P2 projekciós mátrixok.
+1. lépés – Kameramodell és DLT / Gold Standard kalibráció: Egy térbeli Xi=[Xi,Yi,Zi,1]T világpontnak a képsíkra történő xi=[xi,yi,1]T vetületét a 3x4-es P=K[R|t] projekciós mátrix írja le, ahol K a fókuszpontokat (fx,fy), a főpontokat (px,py) és a tengelydőlést (s) tartalmazó belső mátrix, R a 3x3-as ortogonális forgatási mátrix, t pedig az eltolási vektor. Az xixPXi=0 => Ap=0 összefüggésből minden pontpár 2 független egyenletet ad. Megoldás (n>=pontpárra): Kezdeti P becslése ||Ap|| minimalizálásával (SVD / DLT), majd a minpSumi d(xi,PXi)2 visszavetítési hiba és a D1,D2 lencsetorzítások finomítása Levenberg–Marquardt iterációval.
+2. lépés – Sztereó R,T transzformáció: Rögzítjük a közös 3D világkoordináta rendszer origóját az első kamerába (R=I,t1=0), a 2. kamera helyzetét az 1. kamerához viszonyított relatív R forgatás és T eltolás adja meg: P1=K1[I|0], P2=[R|T] (x=K-1x norm. koordináták közötti epipoláris kényszert az E=[T]xR esszenciális mátrix írja le: x’TEx=0)
+Függvényterv: [K1,D1,K2,D2,R,T,imgSize]=stereoParametersToOpenCS(stereoParams) (MATLAB) és
+load_stereo_calibration(config_path) (Python). A MATLAB kalibráció eredményét exportáljuk, a Python függvény beolvassa a paramétereket és felépíti a P1, P2 mátrixokat. Folyamat röviden: szinkronizált képek → MATLAB sztereó kalibráció → OpenCV export → projekciós mátrixok számítása
+2. A tábla térbeli meghatározása
+Cél: A tábla 3D síkjának és lokális koordináta-rendszerének meghatározása az 1. kamera terében külső
+pózbecsléssel. Bemenet: A tábla fizikai mérete (Lw,Lh), 4 sarokpont képi koordinátái (cam1) és K1,D1. Kimenet: Porigin (táblaorigó), uaxis, vaxis (egységvektorok), (a,b,c,d) síkegyütthatók.
+Számítási lépések:
+1. Lokális 3D sarokpotok (CWM): Tábla síkja Z=0, a négy sarokpont: B1=(0,0,0), B2=(LW,0,0), B3=(Lw,Lh,0), B4=(0,Lh,0)
+2. Külső orientáció becslése: Sarokpontok kijelölése az 1. kamera torzításmentesített (UDP) képén
+(manuálisan/ArUco-markerek): xi=(xi,yi), i∈{1,…,4} (CPM). Az estimateExtrinsics(CPM,CWM,UDP) meghatározza a tábla rendszeréből a kamera retébe mutató (Rboard,Tboard) transzformációt: Bi,cam=RboardBiT+Tboard, i∈{1,…,4}
+3. Sík és tengelyek felírása: A kamera-térbe transzformált B1,cam, B2,cam, B4,cam pontokból a metszéspont-számításhoz szükséges paraméterek: Tábla origó: Porigin = B1,cam; Helyi tengelyek e.v.-i: uaxis=(B2,cam-B1,cam)/(||B2,cam-B1,cam||), vaxis=(B4,cam-B1,cam)/(||B4,cam-B1,cam||); Sík normálvektora és eltolása: (ax+by+cz+d=0):n=(a,b,c)T=uaxis*vaxis, d=-(n*Porigin)
+Függvényterv: compute_board_geometry(corners_2d, Lw, Lh, K1, D1) – torzításmentesíti a 4 sarokpontot, pózbecsléssel
+(estimateExtrinsics) meghatározza Rboard, Tboard értékét, majd kiszámítja és visszaadja Porigin,uaxis,vaxis és plane_coeffs=(a,b,c,d)
+paramétereket. Folyamat röviden: 4 sarok és (Lw, Lh) → [pózbecslés] → Bi,cam → Porigin,uaxis,vaxis,(a,b,c,d)
+3. A mutatóujj 2D pozíciójának meghatározása
+Cél: A triangulációhoz szükséges megfeleltetési probléma megoldása: ujjpontok vetületeinek valós idejű detektálása mindkét kamera képén. Bemenet: Két kamera aktuális képkockája, K1,D1,K2,D2. Kimenet: Torzításmentesített 2D landmark-párok.
+Számítási lépések:
+1. Kulcspontok detektálása: MediaPipe-al mindkét képen megkeressük a kezet és kinyerjük a mutatóujj pontjait: INDEX_FINGER_MCP, PIP, DIP, TIP
+2. Pixelkoordinátákra váltás és torzításkorrekció: normalizált koordináták felszorszása a képfelbontással → homogén pixelkoordináták: xi=[xi,yi,1]T, x’i=[x’i,y’i,1]T, i {MCP,PIP,DIP,TIP}; trianguláció lineáris kameramodell t ∈feltételez (x=PX) → cv2.undistortPoints() lencsetorzítási korrekció
+Függvényterv: detect_finger_landmarks(frame_cam1, frame_cam2, K1, D1, K2, D2) – két képkockán lefuttatja a Hands modellt, kinyeri a mutatóujj (x,y) pixelkoordinátáit a cv2.undistortPoints() hívással korrigálja a lencsetorzítást, és visszaadja a landmarks_cam1, landmarks_cam2 szótárakat a triangulate_landmarks() számára.
+Folyamat röviden: Képkockák (cam1, cam2)→MediaPipe Hands→[pixelre skálázás] → cv2.undistortPoints()→2D landmark-párok (x’i,y’i)
+Mutatás-detektálás: 2D landmarkokból 3D mutatási sugár
+Cél: két kamera képén detektált kéz-landmarkokból (MediaPipe: INDEX_FINGER_DIP, INDEX_FINGER_TIP) kiszámolni, merre mutat az előadó. Az eredmény egy 3D sugár, amelyet a következő lépés a tábla síkjával metsz. Bemenet: 2D landmarkok mindkét kamerából (ugyanaz a képkocka), P₁, P₂ (P = P₁, P′ = P₂) projekciós mátrixok. 
+Kimenet: sugár kezdőpontja (PTIP) és egységnyi iránya (v̂).
+1. lépés – 2D landmarkok triangulálása 3D pontokká
+A két kamera más szögből látja a kezet, így ugyanaz a landmark két különböző képpontként jelenik meg. A kalibrációs paraméterekből és a megfelelő képpontpárból kiszámítható a pont 3D helyzete a közös koordinátarendszerben (lineáris triangulálás, SVD). Ezt minden szükséges landmarkra (min. DIP és TIP) külön elvégezzük.
+Kameramodell: x = P·X,  x′ = P′·X (homogén koordináták; x=[x y 1]ᵀ a 2D képpont, X=[X Y Z W]ᵀ a 3D pont).  P = K·[R | t],  t = −R·C̃. ahol a K: belső mátrix (fx,fy fókusz; px,py főpont; s tengelydőlés, digitális kam. ≈ 0), R: forgatás, t: eltolás, C̃: kamera középpontja a világkoordinátában. Ha az 1. kamera az origó: R₁=I, t₁=0; a 2. kamerára R₂=R, t₂=T (relatív pózból).
+Egyenletek: P sorai p¹ᵀ, p²ᵀ, p³ᵀ (P′-é p′¹ᵀ, p′²ᵀ, p′³ᵀ). Az x × PX = 0 összefüggésből kameránként 2 független lineáris egyenlet jön:
+x·(p³ᵀX) − p¹ᵀX = 0  	       y·(p³ᵀX) − p²ᵀX = 0    	(1. kamera, (x,y))
+x′·(p′³ᵀX) − p′¹ᵀX = 0              y′·(p′³ᵀX) − p′²ᵀX = 0 	(2. kamera, (x′,y′))
+A 4 egyenlet egy homogén rendszer: A·X = 0, ahol A (4×4) sorai:
+A = [ x·p³ᵀ − p¹ᵀ ;  y·p³ᵀ − p²ᵀ ;  x′·p′³ᵀ − p′¹ᵀ ;  y′·p′³ᵀ − p′²ᵀ ]
+Megoldás: SVD-vel. A legkisebb szinguláris értékhez tartozó jobb szinguláris vektor adja Xh=[Xh Yh Zh Wh]ᵀ-t; a valódi koordináták: X = Xh/Wh,  Y = Yh/Wh,  Z = Zh/Wh. OpenCV-ben ezt a cv2.triangulatePoints() végzi el.
+Előfeltételek: (a) a képpontok illeszkedjenek a kalibrációhoz; torzított képnél előbb torzításkorrekció, ha a cv2.undistortPoints() normalizált koordinátákat ad, a triangulációhoz belső paraméterektől mentes P-t (P=[R|t], K=I) kell használni; (b) a két pont ugyanahhoz a képkockához tartozzon; (c) valóban ugyanazt a landmarkot jelöljék.
+Függvényterv: triangulate_landmarks(landmarks_cam1, landmarks_cam2, P1, P2)
+A függvény bemenetként megkapja a két kamera megfelelő 2D landmarkjait (pixelkoordináták, (x, y)) és a kamerák P₁, P₂ projekciós mátrixait. Minden landmarkpárra meghívja a cv2.triangulatePoints() függvényt, a kapott homogén koordinátákat elosztja a negyedik komponenssel (X = Xh/Wh, Y = Yh/Wh, Z = Zh/Wh), és visszaadja a 3D pontokat. A visszatérési érték egy map, amelyben a landmark neve (INDEX_FINGER_DIP, INDEX_FINGER_TIP stb.) a hozzá tartozó (X, Y, Z) koordinátához tartozik.
+2. lépés – A mutatás irányvektorának meghatározása
+A triangulált 3D pontokból az ujj irányát számoljuk: a DIP (ujjhegy előtti ízület) és a TIP (ujjhegy) pontot használjuk (szükség esetén a csukló vagy a közbenső pontok is bevonhatók a pontosság javítására). Az irányvektor a következő lépésben a tábla síkjának metszéséhez kell.
+1) Pontok: PDIP=[XD YD ZD]ᵀ,  PTIP=[XT YT ZT]ᵀ (a triangulált 3D pontok).   2) Irány: v = PTIP − PDIP.   3) Normalizálás: v̂ = v/‖v‖ (hossza 1, iránya azonos). Előtte ellenőrizni: ‖v‖ ne legyen nulla vagy ahhoz közeli (különben a landmark-zaj miatt értelmetlen irány jön).
+4) Mutatási sugár: r(λ) = PTIP + λ·v̂,  λ ≥ 0. Ahol PTIP a kezdőpont, v̂ az irány, λ a sugár mentén megtett távolság, a λ ≥ 0 feltétel biztosítja, hogy a találat az ujj előtt van, nem mögötte.
+Függvényterv: calculate_pointing_direction(points_3d)
+A függvény a triangulációból kapott 3D landmarkokat használja, különösen az INDEX_FINGER_DIP és INDEX_FINGER_TIP pontokat. Kiszámítja a két pont különbségéből a v = PTIP − PDIP irányvektort, ellenőrzi, hogy a hossza nem nulla vagy közel nulla, majd egységnyi hosszúra normalizálja (v̂ = v/‖v‖). Ha a vektor hossza túl kicsi, nem ad vissza érvényes irányt. Visszatérési értéke az PTIP kezdőpont és a normalizált v̂ irányvektor, amelyet a következő függvény a tábla síkjával való metszéspont meghatározásához használhat.
+Folyamat röviden
+2D landmarkok (cam1, cam2) → [torzításkorrekció] → triangulate_landmarks() → 3D pontok → calculate_pointing_direction() → sugár (PTIP, v̂) → (következő lépés) metszés a tábla síkjával.
+
+Mutatóujj és a tábla síkjának metszése (3D pont meghatározása)
+Cél: a mutatóujj által meghatározott 3D sugár (PTIP és v̂) és a tábla síkjának (ax+by+cz+d=0) metszéspontjának kiszámítása a 3D térben. 
+Paraméterek: az ujj kezdőpontja PTIP = [x0, y0, z0],  az ujj irányvektora v̂ = [vx, vy, vz]
+a sík normálvektora (a, b, c) és az eltolás mértéke d az első kamera origójához képest
+Sugár képlete: r(λ) = PTIP + λ·v̂,  λ ≥ 0        Sík képlete:  ax + by + cz + d = 0
+Metszéspont Elméleti Számítása:
+sugár koordinátáit kiszámoljuk:  x = x0 + λvx ,   y =  y0 + λvy ,   z =  z0 + λvz 
+behelyettesítünk a sík egyenletébe:  a(x0 + λvx) + b(y0 + λvy) + c(z0 + λvz) + d = 0
+λ paraméter kiszámítása:  λ = ( ax0 + by0 + cz0 + d) / (avx + bvy + cvz)
+3D metszéspont meghatározása:  PINTERSECT = PTIP + λv̂
+Előfeltételek és Szélsőséges esetek:
+Ha a λ számításánál a nevező (avx + bvy + cvz) közel 0, a sugár közel párhuzamos a síkkal így nincsen metszéspont.
+Ha λ < 0 a metszéspont az ujj mögött van, így érvénytelen a mutatási irány szempontjából
+Függvényterv: calculate_intersection(p_tip, v_hat, plane_coeffs)
+Felbontja a paramétereket:  a, b, c, d = plane_coeffs;  x0, y0, z0 = p_tip;  vx, vy, vz = v_hat
+Kiszámolja a nevezőt  divider = a * vx + b * vy + c * vz  és ha közel 0, None-t ad vissza
+Kiszámolja  lambda = ( a * x0 + b * y0 + c*z0 + d ) / divider  ha negatív None-t ad vissza
+Kiszámolja és visszaadja p_intersect = p_tip + lambda * v_hat
+Folyamat röviden
+sugár (PTIP, v̂) és (a,b,c,d sík együtthatók) → [távolság számítás] → [3D pont] → PINTERSECT
+
+A 3D metszéspont transzformálása a tábla 2D koordinátarendszerébe és pixelkoordinátára képzése 
+Cél: a tábla síkján kapott 3D metszéspont (PINTERSECT) átalakítása a kijelző képpontjára
+Paraméterek: PORIGIN (tábla origója), uaxis,vaxis (tábla 2D egységvektorai), Lw, Lh (tábla fizikai szélessége és magassága), valamint SCR_WIDTH, SCR_HEIGHT (képernyő felbontása)
+Számítási Lépések:
+eltolási vektor kiszámítása: w = PINTERSECT - PORIGIN
+vetítés a helyi tengelyekre (skaláris szorzat):  x2D = w  uaxis,  y2D = w  vaxis
+normalizálás (arányok kiszámítása 0 és 1 között):  xnorm = x2D / Lw,  ynorm = y2D / Lh
+értékek korlátozása (clamping) a [0, 1] tartományra → túlindexelés elkerülése
+pixelkoordinátákra képzés: xpixel = xnorm  SCR_WIDTH, ypixel = ynorm  SCR_HEIGHT
+Függvényterv: to_screen_pixels(p_intersect, p_origin, u_axis, v_axis, dimensions, resolution
+Felbontja a paramétereket: Lw, Lh = dimensions; SW, SH = resolution
+Kiszámítja w = p_intersect - p_origin vektort
+Skaláris szorzással meghatározza a lokális koordinátákat: x_2d = w * u_axis; y_2d = w * v_axis 
+Kiszámolja és visszadja: x_px = np.clip(x_2d / Lw) * SW,  y_px = np.clip(y_2d / Lh) * SH
+Eredménye egy 2 dimenziójú vektor p_pixel amely a metszett pont pixelkoordinátája
+Folyamat röviden
+PINTERSECT → [eltolási vektor 3D origóhoz képest] → [vetítés a síkra] → [normalizálás és korlátozás] → [pixel koordinátákra képzés] → Ppixel
+
+A kapott (x,y) koordinátát Kalman filterrel stabilizáljuk.
+Cél: A képernyőre vetített mutató mozgásának stabilizálása a mérési zajok és az apró, véletlenszerű koordináta-ingadozások csökkentésével. A szűrő a korábbi pozíció és a pillanatnyi mérés alapján becsüli meg a mutató aktuális helyzetét.
+Bemenet: A mutató mért képernyőkoordinátái a k. képkockában: zₖ = (xₖ, yₖ).
+Kimenet: A szűrt képernyőkoordináták: (xout, yout).
+A szűrő állapotvektora a mutató pozícióját és sebességét tartalmazza:
+xₖ = [pₓ,ₖ, pᵧ,ₖ, vₓ,ₖ, vᵧ,ₖ]ᵀ
+Ahol pₓ,ₖ és pᵧ,ₖ a becsült pozíciót, vₓ,ₖ és vᵧ,ₖ pedig a becsült sebességet jelölik.
+1. Előrejelzés
+A szűrő az előző képkocka korrigált állapotából megbecsüli az aktuális állapotot:
+xₖ⁻ = Φₖ · xₖ₋₁
+A Φₖ állapotátmeneti mátrix az előző állapot alapján modellezi a pozíció és a sebesség változását. Az előrejelzés bizonytalanságát a következő összefüggéssel frissítjük:
+Pₖ⁻ = Φₖ · Pₖ₋₁ · Φₖᵀ + Qₖ
+A Pₖ a becslés bizonytalanságát, a Qₖ pedig a folyamat zaját modellezi.
+2. Korrekció
+Az aktuális mérés és az előrejelzés különbsége alapján korrigáljuk a becsült állapotot. A mérési modell:
+zₖ = H · xₖ + μₖ
+A H a mérési mátrix, μₖ pedig a mérési zaj. Mivel a bemenet csak a pozíciót tartalmazza, a mérési mátrix az állapotvektor pozíciókomponenseit választja ki.
+A Kalman-erősítés meghatározza, hogy a szűrő mennyire támaszkodjon a mérésre az előrejelzéshez képest:
+Sₖ = H · Pₖ⁻ · Hᵀ + Rₖ
+Kₖ = Pₖ⁻ · Hᵀ · Sₖ⁻¹
+Az Rₖ a mérési zaj kovarianciamátrixa, a Kₖ pedig a Kalman-erősítés.
+A becslés korrigálása:
+xₖ = xₖ⁻ + Kₖ · (zₖ − H · xₖ⁻)
+A korrigált bizonytalanság:
+Pₖ = (I − Kₖ · H) · Pₖ⁻
+3. Kimenet
+A korrigált állapot pozíciókomponensei adják a megjelenítendő koordinátákat:
+xout = pₓ,ₖ
+yout = pᵧ,ₖ
+Függvényterv:
+init_kalman(): az állapotvektor, a kovarianciamátrixok és a szűrő paramétereinek inicializálása.
+update_kalman(x, y): az új mért koordináták fogadása, az előrejelzés és a korrekció végrehajtása, majd a szűrt koordináták visszaadása.
+Folyamat röviden
+Mért koordináták → állapot előrejelzése → mérés feldolgozása → becslés korrigálása → szűrt koordináták továbbítása a Qt overlay számára.
+Egy átlátszó, always-on-top Qt overlay kirajzolja a virtuális pointert bármilyen alkalmazás fölé.
+A megoldást egy külön, keret nélküli Qt-ablakként érdemes felépíteni: ez a teljes virtuális asztalt lefedi, áttetsző marad, nem fogja meg az egérkattintásokat, és a paintEvent() rajzolja rá a virtuális pointert.
+A megvalósítás három fő részből áll:
+Overlay-ablak létrehozása: keret nélküli, áttetsző és mindig felül maradó Qt-ablak.
+Pointer kirajzolása: a QPainter segítségével egy kör, célkereszt vagy egyedi kurzor rajzolása.
+Pozíció frissítése: minden új becsült koordinátánál frissül a pointer helye, majd a Qt újrarajzolja az overlayt.

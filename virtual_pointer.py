@@ -6,14 +6,27 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
+
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QRadialGradient
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
     QMainWindow,
+    QMessageBox,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -22,7 +35,7 @@ IMAGE_SIZE = (1280, 720)
 MOCK_BOARD_SIZE = (600.0, 400.0)
 MOCK_BOARD_DEPTH = 1000.0
 CAMERA_FRAME_SIZE = (640, 360)
-BOARD_MARKER_MARGIN_MM = 20.0
+BOARD_MARKER_MARGIN = 20.0
 
 
 @dataclass(frozen=True)
@@ -139,7 +152,7 @@ def calibration_for_frame_sizes(calibration, size1, size2):
 class ArucoBoardPoseEstimator:
     marker_ids = (0, 1, 2, 3)
 
-    def __init__(self, board_size, marker_size):
+    def __init__(self, board_size, marker_size, marker_margin=BOARD_MARKER_MARGIN):
         if not hasattr(cv2, "aruco"):
             raise RuntimeError(
                 "ArUco support is missing; install opencv-contrib-python."
@@ -159,7 +172,7 @@ class ArucoBoardPoseEstimator:
             self.detector = None
             self.parameters = aruco.DetectorParameters_create()
 
-        margin = BOARD_MARKER_MARGIN_MM
+        margin = marker_margin
         if marker_size + 2 * margin >= min(board_size):
             raise ValueError("Board is too small for the four corner markers.")
         marker_origins = (
@@ -203,7 +216,7 @@ class ArucoBoardPoseEstimator:
             start = self.marker_ids.index(int(detected_id)) * 4
             object_points.extend(self.marker_corners_board[start : start + 4])
             image_points.extend(np.asarray(detected_corners).reshape(4, 2))
-        if len(object_points) < 4:
+        if len(object_points) != len(self.marker_ids) * 4:
             return None
 
         try:
@@ -224,43 +237,17 @@ class ArucoBoardPoseEstimator:
         )
 
 
-def write_board_marker(path, board_size, marker_size):
-    if not hasattr(cv2, "aruco"):
-        raise RuntimeError("ArUco support is missing; install opencv-contrib-python.")
-    if marker_size <= 0 or marker_size + 2 * BOARD_MARKER_MARGIN_MM >= min(board_size):
-        raise ValueError("Board is too small for four markers with 20 mm margins.")
-    aruco = cv2.aruco
-    dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-    pixels_per_mm = 3
-    width = round(board_size[0] * pixels_per_mm)
-    height = round(board_size[1] * pixels_per_mm)
-    marker_pixels = round(marker_size * pixels_per_mm)
-    image = np.full((height, width), 255, dtype=np.uint8)
-    margin_pixels = round(BOARD_MARKER_MARGIN_MM * pixels_per_mm)
-    origins = (
-        (margin_pixels, margin_pixels),
-        (width - margin_pixels - marker_pixels, margin_pixels),
-        (width - margin_pixels - marker_pixels, height - margin_pixels - marker_pixels),
-        (margin_pixels, height - margin_pixels - marker_pixels),
-    )
-    for marker_id, (x, y) in enumerate(origins):
-        if hasattr(aruco, "generateImageMarker"):
-            marker = aruco.generateImageMarker(dictionary, marker_id, 600)
-        else:
-            marker = aruco.drawMarker(dictionary, marker_id, 600)
-        marker = cv2.resize(
-            marker, (marker_pixels, marker_pixels), interpolation=cv2.INTER_NEAREST
-        )
-        image[y : y + marker_pixels, x : x + marker_pixels] = marker
-    if not cv2.imwrite(str(path), image):
-        raise OSError(f"Could not write marker image to {path}.")
-
-
 class StereoCameras:
-    def __init__(self, source1, source2):
+    def __init__(self, source1, source2, loop_videos=True):
         self.captures = []
+        self.video_sources = (
+            isinstance(source1, Path),
+            isinstance(source2, Path),
+        )
+        self.loop_videos = loop_videos
         for source in (source1, source2):
-            capture = cv2.VideoCapture(source, cv2.CAP_ANY)
+            capture_source = str(source) if isinstance(source, Path) else source
+            capture = cv2.VideoCapture(capture_source, cv2.CAP_ANY)
             if not capture.isOpened():
                 capture.release()
                 self.release()
@@ -269,11 +256,20 @@ class StereoCameras:
             self.captures.append(capture)
 
     def read(self):
+        grabbed = [capture.grab() for capture in self.captures]
+        if not all(grabbed) and all(self.video_sources) and self.loop_videos:
+            for capture in self.captures:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            grabbed = [capture.grab() for capture in self.captures]
+        if not all(grabbed):
+            failed_camera = grabbed.index(False) + 1
+            return None, None, f"Camera {failed_camera} did not provide a frame."
+
         frames = []
         for index, capture in enumerate(self.captures, start=1):
-            success, frame = capture.read()
+            success, frame = capture.retrieve()
             if not success or frame is None:
-                return None, None, f"Camera {index} did not provide a frame."
+                return None, None, f"Could not retrieve a frame from camera {index}."
             frames.append(frame)
         return frames[0], frames[1], None
 
@@ -283,12 +279,257 @@ class StereoCameras:
         self.captures.clear()
 
 
-def create_hands_detector():
-    try:
-        import mediapipe as mp
-    except ImportError as error:
-        return None, f"MediaPipe unavailable: {error}"
+def available_camera_indices(max_index=8):
+    available = []
+    for index in range(max_index):
+        capture = cv2.VideoCapture(index, cv2.CAP_ANY)
+        if capture.isOpened():
+            available.append(index)
+        capture.release()
+    return available
 
+
+class CameraSourceDialog(QDialog):
+    def __init__(self, camera_indices, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select stereo inputs")
+        self.selected_sources = None
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.left_source = self._source_combo(camera_indices)
+        self.right_source = self._source_combo(camera_indices)
+        if self.right_source.count() > 1:
+            self.right_source.setCurrentIndex(1)
+        form.addRow("Left / Camera 1", self._source_row(self.left_source, "left"))
+        form.addRow("Right / Camera 2", self._source_row(self.right_source, "right"))
+        layout.addLayout(form)
+        preview_layout = QHBoxLayout()
+        self.preview_labels = []
+        for title in ("Left camera preview", "Right camera preview"):
+            preview_column = QVBoxLayout()
+            preview_title = QLabel(title)
+            preview = QLabel("Select a camera or video")
+            preview.setFixedSize(*CAMERA_FRAME_SIZE)
+            preview.setAlignment(Qt.AlignCenter)
+            preview.setStyleSheet("background: #10151d; color: #a9bacb;")
+            preview_column.addWidget(preview_title)
+            preview_column.addWidget(preview)
+            preview_layout.addLayout(preview_column)
+            self.preview_labels.append(preview)
+        layout.addLayout(preview_layout)
+        self.preview_captures = [None, None]
+        self.left_source.currentIndexChanged.connect(self._reset_previews)
+        self.right_source.currentIndexChanged.connect(self._reset_previews)
+        self.preview_timer = QTimer(self)
+        self.preview_timer.timeout.connect(self._update_previews)
+        self.preview_timer.start(100)
+        self._reset_previews()
+
+        note = QLabel(
+            "For paired videos, select matching left/right recordings that contain "
+            "the projected calibration pattern."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Start selected sources")
+        buttons.accepted.connect(self._accept_sources)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        mock_button = QPushButton("Use synthetic mock feeds")
+        mock_button.clicked.connect(self._accept_mock)
+        layout.addWidget(mock_button)
+
+    @staticmethod
+    def _source_combo(camera_indices):
+        combo = QComboBox()
+        for index in camera_indices:
+            combo.addItem(f"Camera {index}", ("camera", index))
+        if not camera_indices:
+            combo.addItem("No cameras detected", None)
+        return combo
+
+    def _source_row(self, combo, side):
+        row = QHBoxLayout()
+        row.addWidget(combo)
+        browse = QPushButton("Browse video...")
+        browse.clicked.connect(lambda: self._browse_video(combo, side))
+        row.addWidget(browse)
+        container = QWidget()
+        container.setLayout(row)
+        return container
+
+    def _browse_video(self, combo, side):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Choose {side} camera video",
+            "",
+            "Video files (*.mp4 *.avi *.mov *.mkv *.m4v);;All files (*)",
+        )
+        if path:
+            combo.addItem(f"Video: {Path(path).name}", ("video", Path(path)))
+            combo.setCurrentIndex(combo.count() - 1)
+
+    def _accept_sources(self):
+        left = self.left_source.currentData()
+        right = self.right_source.currentData()
+        if left is None or right is None:
+            return
+        if left == right:
+            return
+        self.selected_sources = (left[1], right[1])
+        self._release_previews()
+        self.accept()
+
+    def _accept_mock(self):
+        self.selected_sources = None
+        self._release_previews()
+        self.accept()
+
+    def reject(self):
+        self._release_previews()
+        super().reject()
+
+    def _reset_previews(self, *_):
+        self._release_previews()
+        for index, combo in enumerate((self.left_source, self.right_source)):
+            selected = combo.currentData()
+            if selected is None:
+                self.preview_labels[index].setText("No source selected")
+                continue
+            kind, source = selected
+            capture_source = str(source) if kind == "video" else source
+            capture = cv2.VideoCapture(capture_source, cv2.CAP_ANY)
+            if capture.isOpened():
+                self.preview_captures[index] = capture
+            else:
+                capture.release()
+                self.preview_labels[index].setText("Could not open source")
+
+    def _update_previews(self):
+        for index, capture in enumerate(self.preview_captures):
+            if capture is None:
+                continue
+            success, frame = capture.read()
+            if not success or frame is None:
+                if isinstance(
+                    (self.left_source, self.right_source)[index].currentData()[1],
+                    Path,
+                ):
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            height, width = frame.shape[:2]
+            image = QImage(
+                frame.data,
+                width,
+                height,
+                frame.strides[0],
+                QImage.Format_BGR888,
+            ).copy()
+            self.preview_labels[index].setPixmap(
+                QPixmap.fromImage(image).scaled(
+                    self.preview_labels[index].size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+
+    def _release_previews(self):
+        for index, capture in enumerate(self.preview_captures):
+            if capture is not None:
+                capture.release()
+                self.preview_captures[index] = None
+
+
+class ProjectorCalibrationOverlay(QWidget):
+    accepted = Signal()
+    cancelled = Signal()
+
+    def __init__(self, screen, width_units):
+        super().__init__()
+        self.screen_geometry = screen.geometry()
+        self.width_units = width_units
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating, False)
+        self.setGeometry(self.screen_geometry)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.ready = False
+        self.status = "Show this projected pattern to Camera 1."
+
+        width = self.screen_geometry.width()
+        height = self.screen_geometry.height()
+        self.marker_pixels = max(80, min(160, round(width * 0.1)))
+        self.margin_pixels = max(20, round(width * 0.025))
+        scale = width_units / width
+        self.board_size = (width_units, height * scale)
+        self.marker_size = self.marker_pixels * scale
+        self.marker_margin = self.margin_pixels * scale
+
+        aruco = cv2.aruco
+        dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        self.marker_images = []
+        for marker_id in ArucoBoardPoseEstimator.marker_ids:
+            if hasattr(aruco, "generateImageMarker"):
+                image = aruco.generateImageMarker(dictionary, marker_id, 400)
+            else:
+                image = aruco.drawMarker(dictionary, marker_id, 400)
+            self.marker_images.append(
+                QImage(
+                    image.data,
+                    image.shape[1],
+                    image.shape[0],
+                    image.strides[0],
+                    QImage.Format_Grayscale8,
+                ).copy()
+            )
+
+    def set_ready(self, ready):
+        self.ready = ready
+        self.status = (
+            "Plane found - press Enter to finish calibration."
+            if ready
+            else "Looking for all four projected markers in Camera 1..."
+        )
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.white)
+        w, h = self.width(), self.height()
+        m, s = self.margin_pixels, self.marker_pixels
+        positions = (
+            (m, m),
+            (w - m - s, m),
+            (w - m - s, h - m - s),
+            (m, h - m - s),
+        )
+        for image, (x, y) in zip(self.marker_images, positions):
+            painter.drawImage(x, y, image.scaled(s, s))
+        painter.setPen(Qt.black)
+        painter.drawText(
+            self.rect().adjusted(0, 0, 0, -24),
+            Qt.AlignHCenter | Qt.AlignBottom,
+            self.status,
+        )
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if self.ready:
+                self.accepted.emit()
+            else:
+                self.status = "Markers not found yet. Check the camera view and calibration."
+                self.update()
+        elif event.key() == Qt.Key_Escape:
+            self.cancelled.emit()
+        else:
+            super().keyPressEvent(event)
+
+
+def create_hands_detector():
     hands_api = getattr(getattr(mp, "solutions", None), "hands", None)
     if hands_api is None:
         return (
@@ -674,22 +915,32 @@ class VirtualPointerWindow(QMainWindow):
         cameras,
         hands_detectors,
         input_status,
-        board_size,
-        marker_size,
-        board_pose_estimator,
+        projector_width_units,
     ):
         super().__init__()
         self.calibration = calibration
-        self.board_size = board_size
-        self.marker_size = marker_size
-        self.scene = MockStereoScene(calibration, board_size)
+        self.screen = screen
         self.cameras = cameras
         self.hands_detectors = hands_detectors
-        self.board_pose_estimator = board_pose_estimator
         self.input_status = input_status
         self.kalman = KalmanFilter2D()
-        self.board_geometry = self.scene.board_geometry
         self.screen_geometry = screen.geometry()
+        if cameras is None:
+            self.board_size = MOCK_BOARD_SIZE
+            self.scene = MockStereoScene(calibration, self.board_size)
+            self.board_geometry = self.scene.board_geometry
+        else:
+            self.board_size = (
+                projector_width_units,
+                projector_width_units
+                * self.screen_geometry.height()
+                / self.screen_geometry.width(),
+            )
+            self.scene = MockStereoScene(calibration, self.board_size)
+            self.board_geometry = None
+        self.projector_width_units = projector_width_units
+        self.board_pose_estimator = None
+        self.projector_calibration_overlay = None
         self.laser_overlay = laser_overlay
         self.setWindowTitle("Virtual Pointer | Stereo Demo")
         self.setStyleSheet(
@@ -708,17 +959,77 @@ class VirtualPointerWindow(QMainWindow):
 
         self.status = QLabel(
             f"{input_status}  |  {calibration_label}  |  "
-            f"Board: {board_size[0]:.0f} x {board_size[1]:.0f} mm  |  "
-            f"Corner DICT_4X4_50 IDs 0-3, {marker_size:g} mm"
+            f"Projected surface: {self.board_size[0]:.1f} x "
+            f"{self.board_size[1]:.1f} calibration units"
         )
         self.status.setStyleSheet("color: #a9bacb; padding: 6px;")
         layout.addWidget(self.status)
+        self.calibrate_button = QPushButton("Calibrate projected surface")
+        self.calibrate_button.setEnabled(cameras is not None)
+        self.calibrate_button.clicked.connect(self.start_projector_calibration)
+        layout.addWidget(self.calibrate_button)
         self.setCentralWidget(central)
         self.setMinimumSize(900, 440)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_demo)
         self.timer.start(33)
+
+    def start_projector_calibration(self):
+        if self.cameras is None:
+            return
+        if self.projector_calibration_overlay is not None:
+            self.projector_calibration_overlay.close()
+        width = self.projector_width_units
+        screen_width = self.screen_geometry.width()
+        margin = max(20, round(screen_width * 0.025))
+        marker_pixels = max(80, min(160, round(screen_width * 0.1)))
+        units_per_pixel = width / screen_width
+        self.board_size = (
+            width,
+            width * self.screen_geometry.height() / screen_width,
+        )
+        self.board_pose_estimator = ArucoBoardPoseEstimator(
+            self.board_size,
+            marker_pixels * units_per_pixel,
+            margin * units_per_pixel,
+        )
+        overlay = ProjectorCalibrationOverlay(self.screen, self.projector_width_units)
+        overlay.accepted.connect(self.finish_projector_calibration)
+        overlay.cancelled.connect(self.cancel_projector_calibration)
+        self.projector_calibration_overlay = overlay
+        self.board_geometry = None
+        self.laser_overlay.set_position(None)
+        self.laser_overlay.hide()
+        overlay.showFullScreen()
+        overlay.raise_()
+        overlay.activateWindow()
+        overlay.setFocus()
+
+    def finish_projector_calibration(self):
+        if self.board_geometry is None:
+            return
+        overlay = self.projector_calibration_overlay
+        self.projector_calibration_overlay = None
+        if overlay is not None:
+            overlay.close()
+        self.laser_overlay.show()
+        self.status.setText(
+            f"{self.input_status}  |  Projector plane calibrated; "
+            "press the button to recalibrate."
+        )
+
+    def cancel_projector_calibration(self):
+        overlay = self.projector_calibration_overlay
+        self.projector_calibration_overlay = None
+        if overlay is not None:
+            overlay.close()
+        self.board_geometry = None
+        self.laser_overlay.show()
+        self.status.setText(
+            f"{self.input_status}  |  Projector calibration cancelled; "
+            "pointer disabled until calibrated."
+        )
 
     def update_demo(self):
         if self.cameras is None:
@@ -735,20 +1046,24 @@ class VirtualPointerWindow(QMainWindow):
             frame_calibration = calibration_for_frame_sizes(
                 self.calibration, size1, size2
             )
-            detected_board = self.board_pose_estimator.estimate(
-                frame1, frame_calibration.K1, frame_calibration.D1
-            )
-            if detected_board is None:
+            if self.projector_calibration_overlay is not None:
                 self.camera1.set_frame(frame1)
                 self.camera2.set_frame(frame2)
                 self.laser_overlay.set_position(None)
+                detected_board = self.board_pose_estimator.estimate(
+                    frame1, frame_calibration.K1, frame_calibration.D1
+                )
+                if detected_board is not None:
+                    self.board_geometry = detected_board
+                self.projector_calibration_overlay.set_ready(
+                    detected_board is not None
+                )
                 self.status.setText(
-                    f"LIVE CAMERAS  |  {self.input_status}  |  "
-                    f"{size1[0]}x{size1[1]} + {size2[0]}x{size2[1]}  |  "
-                    "No board markers (IDs 0-3) visible in Camera 1."
+                    f"Projector calibration  |  Camera 1: {size1[0]}x{size1[1]}  |  "
+                    f"Camera 2: {size2[0]}x{size2[1]}  |  "
+                    f"{'All four markers detected' if detected_board is not None else 'Waiting for markers 0-3'}"
                 )
                 return
-            self.board_geometry = detected_board
             raw1, raw2 = detect_finger_landmarks(
                 frame1, frame2, frame_calibration, self.hands_detectors
             )
@@ -768,6 +1083,13 @@ class VirtualPointerWindow(QMainWindow):
                         "Show one hand to both cameras."
                     )
                 return
+
+        if self.board_geometry is None:
+            self.laser_overlay.set_position(None)
+            self.status.setText(
+                    f"{self.input_status}  |  Calibrate the projected surface first."
+            )
+            return
 
         self.camera1.set_frame(frame1)
         self.camera2.set_frame(frame2)
@@ -826,71 +1148,39 @@ class VirtualPointerWindow(QMainWindow):
 
 def main():
     parser = argparse.ArgumentParser(description="Stereo virtual pointer")
+    parser.add_argument("--camera1", help="Left camera index or stream URL.")
+    parser.add_argument("--camera2", help="Right camera index or stream URL.")
+    parser.add_argument("--video1", type=Path, help="Left-camera mock video file.")
+    parser.add_argument("--video2", type=Path, help="Right-camera mock video file.")
     parser.add_argument(
-        "--camera1",
-        default="0",
-        help="First OpenCV camera index or stream URL (default: 0).",
-    )
-    parser.add_argument(
-        "--camera2",
-        default="1",
-        help="Second OpenCV camera index or stream URL (default: 1).",
+        "--projector-width-units",
+        type=float,
+        help="Projected image width in the same units as stereo calibration T.",
     )
     parser.add_argument(
         "--mock",
         action="store_true",
-        help="Use synthetic camera feeds instead of live cameras.",
-    )
-    parser.add_argument(
-        "--board-width-mm",
-        type=float,
-        default=600.0,
-        help="Physical board width in mm (default: 600).",
-    )
-    parser.add_argument(
-        "--board-height-mm",
-        type=float,
-        default=400.0,
-        help="Physical board height in mm (default: 400).",
-    )
-    parser.add_argument(
-        "--marker-size-mm",
-        type=float,
-        default=80.0,
-        help="Printed black ArUco marker size, excluding white margin (default: 80).",
-    )
-    parser.add_argument(
-        "--generate-board",
-        "--generate-board-marker",
-        dest="generate_board",
-        metavar="PNG",
-        help="Write the printable four-marker DICT_4X4_50 board image and exit.",
+        help="Use generated mock stereo feeds.",
     )
     args = parser.parse_args()
-    board_size = (args.board_width_mm, args.board_height_mm)
-    if min(*board_size, args.marker_size_mm) <= 0:
-        parser.error("Board and marker dimensions must be positive.")
-    if args.marker_size_mm + 2 * BOARD_MARKER_MARGIN_MM >= min(board_size):
-        parser.error("Four markers need at least 20 mm of board margin on each side.")
-    if args.generate_board:
-        try:
-            write_board_marker(
-                args.generate_board, board_size, args.marker_size_mm
-            )
-        except (OSError, RuntimeError, ValueError) as error:
-            parser.error(str(error))
-        return 0
-
-    def camera_source(value):
-        try:
-            return int(value)
-        except ValueError:
-            return value
+    left_explicit = args.camera1 is not None or args.video1 is not None
+    right_explicit = args.camera2 is not None or args.video2 is not None
+    if args.mock and (left_explicit or right_explicit):
+        parser.error("--mock cannot be combined with camera or video sources.")
+    if left_explicit != right_explicit:
+        parser.error("Specify both left and right camera/video sources.")
+    if args.camera1 is not None and args.video1 is not None:
+        parser.error("Choose either --camera1 or --video1, not both.")
+    if args.camera2 is not None and args.video2 is not None:
+        parser.error("Choose either --camera2 or --video2, not both.")
+    if args.projector_width_units is not None and args.projector_width_units <= 0:
+        parser.error("--projector-width-units must be positive.")
 
     application = QApplication([sys.argv[0]])
     screen = application.primaryScreen()
     if screen is None:
         raise RuntimeError("No display is available for the laser-pointer overlay.")
+
     calibration_path = Path(__file__).with_name("calibration_params.json")
     try:
         calibration = load_stereo_calibration(calibration_path)
@@ -899,33 +1189,78 @@ def main():
         calibration = mock_stereo_calibration()
         calibration_label = "Built-in mock calibration (file not found)"
 
+    sources = None
+    if args.mock:
+        mock_mode = True
+    elif left_explicit:
+        def camera_source(value):
+            try:
+                return int(value)
+            except ValueError:
+                return value
+
+        source1 = args.video1 if args.video1 is not None else camera_source(args.camera1)
+        source2 = args.video2 if args.video2 is not None else camera_source(args.camera2)
+        sources = (source1, source2)
+        if source1 == source2:
+            parser.error("Left and right inputs must be different sources.")
+        mock_mode = False
+    else:
+        selector = CameraSourceDialog(available_camera_indices())
+        if selector.exec() != QDialog.Accepted:
+            return 0
+        sources = selector.selected_sources
+        mock_mode = sources is None
+
     cameras = None
     hands_detectors = (None, None)
-    board_pose_estimator = None
-    if args.mock:
-        input_status = "MOCK CAMERAS (requested)"
-    else:
+    projector_width_units = args.projector_width_units or 1000.0
+    if not mock_mode:
         try:
-            cameras = StereoCameras(
-                camera_source(args.camera1), camera_source(args.camera2)
+            cameras = StereoCameras(*sources)
+        except OSError as error:
+            QMessageBox.critical(None, "Camera input error", str(error))
+            return 1
+
+        if args.projector_width_units is None:
+            projector_width_units, accepted = QInputDialog.getDouble(
+                None,
+                "Projector-plane scale",
+                "Projected image width in the SAME unit as stereo calibration T "
+                "(for example mm if T is in mm):",
+                1000.0,
+                0.01,
+                1_000_000_000.0,
+                2,
             )
-            board_pose_estimator = ArucoBoardPoseEstimator(
-                board_size, args.marker_size_mm
-            )
+            if not accepted:
+                cameras.release()
+                return 0
+
+        try:
+            if not hasattr(cv2, "aruco"):
+                raise RuntimeError(
+                    "ArUco support is missing; install opencv-contrib-python."
+                )
             detector1, detector_error1 = create_hands_detector()
             detector2, detector_error2 = create_hands_detector()
             hands_detectors = (detector1, detector2)
-            input_status = f"LIVE CAMERAS ({args.camera1}, {args.camera2})"
-            detector_errors = [
-                message for message in (detector_error1, detector_error2) if message
-            ]
-            if detector_errors:
-                input_status += "  |  " + "; ".join(dict.fromkeys(detector_errors))
-        except (OSError, RuntimeError, ValueError) as error:
-            if cameras is not None:
-                cameras.release()
-                cameras = None
-            input_status = f"MOCK CAMERAS (live open failed: {error})"
+        except (RuntimeError, ValueError) as error:
+            cameras.release()
+            QMessageBox.critical(None, "Stereo initialization error", str(error))
+            return 1
+        source_names = tuple(
+            source.name if isinstance(source, Path) else str(source)
+            for source in sources
+        )
+        input_status = f"STEREO INPUTS ({source_names[0]}, {source_names[1]})"
+        detector_errors = [
+            message for message in (detector_error1, detector_error2) if message
+        ]
+        if detector_errors:
+            input_status += "  |  " + "; ".join(dict.fromkeys(detector_errors))
+    else:
+        input_status = "SYNTHETIC MOCK CAMERAS"
 
     laser_overlay = LaserOverlay()
     laser_overlay.setGeometry(screen.geometry())
@@ -938,9 +1273,7 @@ def main():
         cameras,
         hands_detectors,
         input_status,
-        board_size,
-        args.marker_size_mm,
-        board_pose_estimator,
+        projector_width_units,
     )
     if cameras is not None:
         application.aboutToQuit.connect(cameras.release)
@@ -948,6 +1281,8 @@ def main():
         if detector is not None:
             application.aboutToQuit.connect(detector.close)
     window.show()
+    if cameras is not None:
+        QTimer.singleShot(500, window.start_projector_calibration)
     return application.exec()
 
 
