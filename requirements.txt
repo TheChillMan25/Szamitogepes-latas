@@ -1,4 +1,5 @@
 opencv-contrib-python
 mediapipe
 numpy
+pillow
 PySide6-Essentials
