@@ -2,3 +2,4 @@
 __pycache__/
 calibration_images/
 calibration_params.json
+hands_landmark.task
