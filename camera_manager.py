@@ -3,6 +3,7 @@ import re
 import sys
 import threading
 import time
+import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
 import cv2
@@ -10,6 +11,9 @@ import numpy as np
 
 MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN = 5
 RECONNECT_BACKOFF_SEC = 0.6
+DEFAULT_CAPTURE_TIMEOUT_SEC = 2.0
+MAX_FRAME_AGE_SEC = 0.3
+MAX_STEREO_FRAME_SKEW_SEC = 0.025
 
 
 def _safe_release(cap: Optional[cv2.VideoCapture]) -> None:
@@ -61,15 +65,24 @@ def _open_capture_with_backend(
 
 
 def open_capture(idx: int, timeout_sec: Optional[float] = None) -> Optional[cv2.VideoCapture]:
+    if timeout_sec is None:
+        timeout_sec = DEFAULT_CAPTURE_TIMEOUT_SEC
+
     if sys.platform.startswith("win"):
         for backend in _windows_backends():
             cap = _open_capture_with_backend(idx, backend, timeout_sec=timeout_sec)
             if cap is not None:
                 return cap
+            cap = _open_capture_with_backend(idx, backend)
+            if cap is not None:
+                return cap
         return None
 
     backend = getattr(cv2, "CAP_V4L2", None) if hasattr(cv2, "CAP_V4L2") else None
-    return _open_capture_with_backend(idx, backend, timeout_sec=timeout_sec)
+    cap = _open_capture_with_backend(idx, backend, timeout_sec=timeout_sec)
+    if cap is None:
+        cap = _open_capture_with_backend(idx, backend)
+    return cap
 
 
 def _apply_auto_exposure(cap: cv2.VideoCapture, enabled: bool) -> None:
@@ -112,6 +125,11 @@ def apply_camera_settings(cap: Optional[cv2.VideoCapture], settings: dict) -> No
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         cap.set(cv2.CAP_PROP_FPS, fps)
+        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+            cap.set(
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                int(DEFAULT_CAPTURE_TIMEOUT_SEC * 1000),
+            )
 
         autofocus = bool(settings.get("autofocus", False))
         cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if autofocus else 0)
@@ -204,6 +222,8 @@ class SingleThreadStereoCapture:
         self._cap_right: Optional[cv2.VideoCapture] = None
         self._latest_left: Optional[np.ndarray] = None
         self._latest_right: Optional[np.ndarray] = None
+        self._left_timestamp: Optional[float] = None
+        self._right_timestamp: Optional[float] = None
         self._left_online = False
         self._right_online = False
         self._fps_left = 0.0
@@ -223,6 +243,12 @@ class SingleThreadStereoCapture:
             self._left_idx = int(left_idx)
             self._right_idx = int(right_idx)
             self._reopen_requested = True
+            self._latest_left = None
+            self._latest_right = None
+            self._left_timestamp = None
+            self._right_timestamp = None
+            self._left_online = False
+            self._right_online = False
 
     def update_settings(self, settings: dict) -> None:
         with self._state_lock:
@@ -233,11 +259,25 @@ class SingleThreadStereoCapture:
         with self._state_lock:
             self._scan_requested = True
 
-    def get_snapshot(self) -> Dict[str, object]:
+    def get_snapshot(self, copy_frames: bool = True) -> Dict[str, object]:
         with self._state_lock:
             return {
-                "left_frame": None if self._latest_left is None else self._latest_left.copy(),
-                "right_frame": None if self._latest_right is None else self._latest_right.copy(),
+                "left_frame": (
+                    None
+                    if self._latest_left is None
+                    else self._latest_left.copy()
+                    if copy_frames
+                    else self._latest_left
+                ),
+                "right_frame": (
+                    None
+                    if self._latest_right is None
+                    else self._latest_right.copy()
+                    if copy_frames
+                    else self._latest_right
+                ),
+                "left_timestamp": self._left_timestamp,
+                "right_timestamp": self._right_timestamp,
                 "left_online": self._left_online,
                 "right_online": self._right_online,
                 "fps_left": self._fps_left,
@@ -246,11 +286,47 @@ class SingleThreadStereoCapture:
                 "right_idx": self._right_idx,
             }
 
+    def get_synchronized_snapshot(
+        self,
+        max_skew_sec: float = MAX_STEREO_FRAME_SKEW_SEC,
+        max_age_sec: float = MAX_FRAME_AGE_SEC,
+    ) -> Dict[str, object]:
+        snapshot = self.get_snapshot(copy_frames=False)
+        left_timestamp = snapshot["left_timestamp"]
+        right_timestamp = snapshot["right_timestamp"]
+        now = time.perf_counter()
+        synchronized = (
+            snapshot["left_frame"] is not None
+            and snapshot["right_frame"] is not None
+            and isinstance(left_timestamp, float)
+            and isinstance(right_timestamp, float)
+            and abs(left_timestamp - right_timestamp) <= max_skew_sec
+            and now - left_timestamp <= max_age_sec
+            and now - right_timestamp <= max_age_sec
+        )
+        if not synchronized:
+            snapshot["left_frame"] = None
+            snapshot["right_frame"] = None
+        return snapshot
+
     def close(self) -> None:
         with self._state_lock:
             self._running = False
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            with self._state_lock:
+                cap_l, cap_r = self._cap_left, self._cap_right
+            _safe_release(cap_l)
+            _safe_release(cap_r)
+            self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            warnings.warn(
+                "Camera capture did not stop after release; its daemon thread is still blocked.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
         with self._io_lock:
             self._close_both_unlocked()
 
@@ -286,6 +362,10 @@ class SingleThreadStereoCapture:
             self._right_fail_count = 0
             self._last_left_time = now
             self._last_right_time = now
+            self._latest_left = None
+            self._latest_right = None
+            self._left_timestamp = None
+            self._right_timestamp = None
 
     def _reopen_side_unlocked(self, side: str, cam_idx: int, settings: dict, now: float) -> None:
         is_left = side == "left"
@@ -311,12 +391,16 @@ class SingleThreadStereoCapture:
                 self._cap_left = new_cap
                 self._left_online = new_cap is not None
                 self._left_fail_count = 0
+                self._latest_left = None
+                self._left_timestamp = None
                 if new_cap is not None:
                     self._last_left_time = now
             else:
                 self._cap_right = new_cap
                 self._right_online = new_cap is not None
                 self._right_fail_count = 0
+                self._latest_right = None
+                self._right_timestamp = None
                 if new_cap is not None:
                     self._last_right_time = now
 
@@ -344,19 +428,22 @@ class SingleThreadStereoCapture:
             ret, frame = False, None
 
         if ret and frame is not None and frame.size > 0:
+            timestamp = time.perf_counter()
             with self._state_lock:
                 if is_left:
-                    dt = now - self._last_left_time
-                    self._last_left_time = now
+                    dt = timestamp - self._last_left_time
+                    self._last_left_time = timestamp
                     self._latest_left = frame
+                    self._left_timestamp = timestamp
                     self._left_online = True
                     self._left_fail_count = 0
                     if dt > 0:
                         self._fps_left = 0.85 * self._fps_left + 0.15 * (1.0 / dt)
                 else:
-                    dt = now - self._last_right_time
-                    self._last_right_time = now
+                    dt = timestamp - self._last_right_time
+                    self._last_right_time = timestamp
                     self._latest_right = frame
+                    self._right_timestamp = timestamp
                     self._right_online = True
                     self._right_fail_count = 0
                     if dt > 0:
@@ -384,6 +471,87 @@ class SingleThreadStereoCapture:
                 else:
                     self._last_right_reconnect_try = now
             self._reopen_side_unlocked(side, cam_idx, settings, now)
+
+    def _poll_pair_unlocked(
+        self, left_idx: int, right_idx: int, settings: dict, now: float
+    ) -> None:
+        with self._state_lock:
+            cap_l = self._cap_left
+            cap_r = self._cap_right
+
+        if cap_l is None or cap_r is None:
+            self._poll_side_unlocked("left", left_idx, settings, now)
+            self._poll_side_unlocked("right", right_idx, settings, now)
+            return
+
+        try:
+            grabbed_l = cap_l.grab()
+            timestamp_l = time.perf_counter()
+        except Exception:
+            grabbed_l, timestamp_l = False, time.perf_counter()
+        try:
+            grabbed_r = cap_r.grab()
+            timestamp_r = time.perf_counter()
+        except Exception:
+            grabbed_r, timestamp_r = False, time.perf_counter()
+
+        frames: Dict[str, Tuple[bool, Optional[np.ndarray], float]] = {
+            "left": (False, None, timestamp_l),
+            "right": (False, None, timestamp_r),
+        }
+        for side, cap, grabbed, timestamp in (
+            ("left", cap_l, grabbed_l, timestamp_l),
+            ("right", cap_r, grabbed_r, timestamp_r),
+        ):
+            if grabbed:
+                try:
+                    ret, frame = cap.retrieve()
+                except Exception:
+                    ret, frame = False, None
+                if ret and frame is not None and frame.size > 0:
+                    frames[side] = (True, frame, timestamp)
+
+        for side, cam_idx in (("left", left_idx), ("right", right_idx)):
+            ok, frame, timestamp = frames[side]
+            is_left = side == "left"
+            if ok and frame is not None:
+                with self._state_lock:
+                    if is_left:
+                        dt = timestamp - self._last_left_time
+                        self._last_left_time = timestamp
+                        self._latest_left = frame
+                        self._left_timestamp = timestamp
+                        self._left_online = True
+                        self._left_fail_count = 0
+                        if dt > 0:
+                            self._fps_left = 0.85 * self._fps_left + 0.15 / dt
+                    else:
+                        dt = timestamp - self._last_right_time
+                        self._last_right_time = timestamp
+                        self._latest_right = frame
+                        self._right_timestamp = timestamp
+                        self._right_online = True
+                        self._right_fail_count = 0
+                        if dt > 0:
+                            self._fps_right = 0.85 * self._fps_right + 0.15 / dt
+                continue
+
+            with self._state_lock:
+                if is_left:
+                    self._left_fail_count += 1
+                    fails = self._left_fail_count
+                    self._fps_left = 0.0
+                    if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
+                        self._left_online = False
+                else:
+                    self._right_fail_count += 1
+                    fails = self._right_fail_count
+                    self._fps_right = 0.0
+                    if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
+                        self._right_online = False
+
+            if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
+                self._reopen_side_unlocked(side, cam_idx, settings, now)
 
     def _capture_loop(self) -> None:
         while True:
@@ -424,8 +592,9 @@ class SingleThreadStereoCapture:
                         apply_camera_settings(cap_r, settings)
 
                 now = time.perf_counter()
-                self._poll_side_unlocked("left", left_idx, settings, now)
-                if right_idx != left_idx:
-                    self._poll_side_unlocked("right", right_idx, settings, now)
+                if right_idx == left_idx:
+                    self._poll_side_unlocked("left", left_idx, settings, now)
+                else:
+                    self._poll_pair_unlocked(left_idx, right_idx, settings, now)
 
             time.sleep(self._poll_interval_sec)

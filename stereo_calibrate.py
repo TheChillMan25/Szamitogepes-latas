@@ -1,10 +1,7 @@
 import glob
 import json
 import os
-import re
-import sys
 import threading
-import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import List, Optional, Tuple
@@ -13,6 +10,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from camera_manager import (
+    SingleThreadStereoCapture,
+    list_video_device_indices,
+)
 
 SETTINGS_FILE = "./camera_settings.json"
 CALIB_IMAGES_DIR = "./stereo_calibration_images"
@@ -35,49 +36,6 @@ DEFAULT_SETTINGS = {
 }
 
 RESOLUTIONS = ["640x480", "800x600", "1280x720", "1920x1080"]
-MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN = 5
-RECONNECT_BACKOFF_SEC = 0.6
-
-
-def _open_capture(idx: int) -> cv2.VideoCapture:
-    if sys.platform.startswith("win"):
-        for backend_name in ("CAP_DSHOW", "CAP_MSMF"):
-            if hasattr(cv2, backend_name):
-                cap = cv2.VideoCapture(idx, getattr(cv2, backend_name))
-                if cap is not None and cap.isOpened():
-                    return cap
-                if cap is not None:
-                    cap.release()
-        return cv2.VideoCapture(idx, getattr(cv2, "CAP_ANY", 0))
-
-    if hasattr(cv2, "CAP_V4L2"):
-        return cv2.VideoCapture(idx, cv2.CAP_V4L2)
-    return cv2.VideoCapture(idx)
-
-
-def list_video_device_indices(max_devices: int = 8) -> List[int]:
-    if not sys.platform.startswith("win"):
-        paths = sorted(glob.glob("/dev/video*"))
-        indices: List[int] = []
-        for p in paths:
-            m = re.search(r"(\d+)$", p)
-            if m:
-                idx = int(m.group(1))
-                if idx < max_devices and idx not in indices:
-                    indices.append(idx)
-        if indices:
-            return indices
-    return list(range(max_devices))
-
-
-def _apply_auto_exposure(cap: cv2.VideoCapture, enabled: bool):
-    """Set V4L2/OpenCV auto exposure mode with fallback values across drivers."""
-    if not hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
-        return
-    primary_val = 3 if enabled else 1
-    fallback_val = 0.75 if enabled else 0.25
-    if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, primary_val):
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, fallback_val)
 
 
 def _orient_corners_top_left(corners: np.ndarray, pattern_size: Tuple[int, int]) -> np.ndarray:
@@ -138,41 +96,6 @@ def _detect_checkerboard_corners(gray: np.ndarray, pattern_size: Tuple[int, int]
     refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
     oriented = _orient_corners_top_left(refined, pattern_size)
     return True, oriented
-
-
-def probe_single_camera(idx: int, timeout_sec: float = 1.5) -> Optional[int]:
-    """Probe a single camera index with a timeout so a hung V4L2 driver cannot freeze startup."""
-    result: List[Optional[int]] = [None]
-
-    def _worker():
-        cap = _open_capture(idx)
-        try:
-            if cap.isOpened():
-                if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(timeout_sec * 1000))
-                if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(timeout_sec * 1000))
-                ret, frame = cap.read()
-                if ret and frame is not None and frame.size > 0:
-                    result[0] = idx
-        finally:
-            cap.release()
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=timeout_sec)
-    return result[0]
-
-
-def scan_available_cameras(max_devices: int = 8) -> List[int]:
-    """Probe candidate video indices with per-device timeouts."""
-    candidates = list_video_device_indices(max_devices)
-    available = []
-    for idx in candidates:
-        found = probe_single_camera(idx, timeout_sec=1.5)
-        if found is not None:
-            available.append(found)
-    return available if available else candidates[:2]
 
 
 def _draw_pose_axes_fallback(
@@ -420,23 +343,7 @@ class StereoCameraApp:
 
         self.settings = self.load_settings()
 
-        # Camera & thread state
-        self.lock = threading.Lock()
         self.running = True
-        self.cap_left: Optional[cv2.VideoCapture] = None
-        self.cap_right: Optional[cv2.VideoCapture] = None
-        self.latest_left: Optional[np.ndarray] = None
-        self.latest_right: Optional[np.ndarray] = None
-        self.left_online = False
-        self.right_online = False
-        self.fps_left = 0.0
-        self.fps_right = 0.0
-        self._last_left_time = time.perf_counter()
-        self._last_right_time = time.perf_counter()
-        self._left_fail_count = 0
-        self._right_fail_count = 0
-        self._last_left_reconnect_try = 0.0
-        self._last_right_reconnect_try = 0.0
 
         # Calibration & rectification state
         self.calibration_mode = False
@@ -457,11 +364,13 @@ class StereoCameraApp:
         initial_candidates = list_video_device_indices()
         self.left_cam_combo["values"] = initial_candidates
         self.right_cam_combo["values"] = initial_candidates
+        self.capture = SingleThreadStereoCapture(
+            settings=self.settings,
+            left_idx=int(self.left_cam_var.get()),
+            right_idx=int(self.right_cam_var.get()),
+            on_scan_complete=self._on_camera_scan_complete,
+        )
         self.status_var.set("Scanning cameras & loading saved calibration pairs...")
-
-        # Start capture loop & UI refresh loop without blocking initial render
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.capture_thread.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(50, self._async_initial_camera_setup)
@@ -551,6 +460,9 @@ class StereoCameraApp:
                     continue
                 if frame_l.shape[:2] != frame_r.shape[:2]:
                     continue
+                pair_size = (frame_l.shape[1], frame_l.shape[0])
+                if detected_size is not None and pair_size != detected_size:
+                    continue
 
                 gray_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2GRAY)
                 gray_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
@@ -561,7 +473,7 @@ class StereoCameraApp:
                     continue
 
                 assert corners_l is not None and corners_r is not None
-                detected_size = (gray_l.shape[1], gray_l.shape[0])
+                detected_size = pair_size
 
                 m_num = re.search(r"(\d+)", base)
                 if m_num:
@@ -865,13 +777,11 @@ class StereoCameraApp:
     # Camera Management & Auto-Reconnect
     # ------------------------------------------------------------------
     def _async_initial_camera_setup(self):
-        def _worker():
-            cams = scan_available_cameras()
-            if not self.running:
-                return
-            self.root.after(0, lambda c=cams: self._on_initial_scan_done(c))
+        self.capture.request_scan()
 
-        threading.Thread(target=_worker, daemon=True).start()
+    def _on_camera_scan_complete(self, cams: List[int]):
+        if self.running:
+            self.root.after(0, lambda c=cams: self._on_initial_scan_done(c))
 
     def _on_initial_scan_done(self, cams: List[int]):
         if not self.running:
@@ -890,21 +800,7 @@ class StereoCameraApp:
 
     def _rescan_cameras(self):
         self.status_var.set("Rescanning cameras...")
-
-        def _worker():
-            cams = scan_available_cameras()
-            if not self.running:
-                return
-            self.root.after(0, lambda c=cams: self._on_rescan_done(c))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_rescan_done(self, cams: List[int]):
-        if not self.running:
-            return
-        self.left_cam_combo["values"] = cams
-        self.right_cam_combo["values"] = cams
-        self.status_var.set(f"Detected cameras: {cams}")
+        self.capture.request_scan()
 
     def _on_camera_selection_changed(self):
         left_idx = int(self.left_cam_var.get())
@@ -913,170 +809,24 @@ class StereoCameraApp:
             messagebox.showwarning("Same Camera", "Left and Right cameras should use different indices.")
         self._open_selected_cameras()
 
-    def _release_single_cap(self, cap: Optional[cv2.VideoCapture]):
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
-
-    def _release_cameras(self):
-        with self.lock:
-            cap_l = self.cap_left
-            cap_r = self.cap_right
-            self.cap_left = None
-            self.cap_right = None
-            self.left_online = False
-            self.right_online = False
-        self._release_single_cap(cap_l)
-        self._release_single_cap(cap_r)
-
     def _open_selected_cameras(self):
-        self._release_cameras()
+        self._sync_widgets_to_settings()
         left_idx = int(self.left_cam_var.get())
         right_idx = int(self.right_cam_var.get())
-
-        cap_l = _open_capture(left_idx)
-        cap_r = _open_capture(right_idx)
-
-        with self.lock:
-            self.cap_left = cap_l
-            self.cap_right = cap_r
-            self.left_online = bool(cap_l and cap_l.isOpened())
-            self.right_online = bool(cap_r and cap_r.isOpened())
-            self._left_fail_count = 0
-            self._right_fail_count = 0
-
-        self._apply_camera_properties()
+        self.capture.update_settings(self.settings)
+        self.capture.set_indices(left_idx, right_idx)
         self.status_var.set(f"Opened Left Cam #{left_idx} and Right Cam #{right_idx}")
 
-    def _get_target_res_and_fps(self) -> Tuple[int, int, int]:
-        res_str = self.res_var.get()
-        try:
-            w, h = [int(x) for x in res_str.split("x")]
-        except ValueError:
-            w, h = 1280, 720
-        return w, h, int(self.fps_var.get())
-
-    def _apply_single_cam_props(self, cap: Optional[cv2.VideoCapture], width: int, height: int, fps: int):
-        if cap is None or not cap.isOpened():
-            return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-
-        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if self.autofocus_var.get() else 0)
-        if not self.autofocus_var.get():
-            cap.set(cv2.CAP_PROP_FOCUS, int(self.focus_var.get()))
-
-        auto_exp = bool(self.auto_exposure_var.get())
-        _apply_auto_exposure(cap, auto_exp)
-        if not auto_exp:
-            cap.set(cv2.CAP_PROP_EXPOSURE, float(self.exposure_var.get()))
-
-        cap.set(cv2.CAP_PROP_BRIGHTNESS, float(self.brightness_var.get()))
-        cap.set(cv2.CAP_PROP_CONTRAST, float(self.contrast_var.get()))
-
     def _apply_camera_properties(self):
-        w, h, fps = self._get_target_res_and_fps()
-        with self.lock:
-            self._apply_single_cam_props(self.cap_left, w, h, fps)
-            self._apply_single_cam_props(self.cap_right, w, h, fps)
+        self._sync_widgets_to_settings()
+        w, h = [int(value) for value in self.settings["resolution"].split("x")]
+        fps = int(self.settings["fps"])
+        self.capture.update_settings(self.settings)
 
         exp_desc = "AUTO" if self.auto_exposure_var.get() else f"MANUAL ({self.exposure_var.get()})"
         self.status_var.set(
             f"Applied {w}x{h} @ {fps} FPS | Focus={self.focus_var.get()} (AF={self.autofocus_var.get()}) | Exp={exp_desc}"
         )
-
-    def _attempt_reconnect_side(self, side: str, now: float):
-        is_left = side == "left"
-        last_try = self._last_left_reconnect_try if is_left else self._last_right_reconnect_try
-        if now - last_try < RECONNECT_BACKOFF_SEC:
-            return
-
-        if is_left:
-            self._last_left_reconnect_try = now
-            cam_idx = int(self.left_cam_var.get())
-            old_cap = self.cap_left
-        else:
-            self._last_right_reconnect_try = now
-            cam_idx = int(self.right_cam_var.get())
-            old_cap = self.cap_right
-
-        self._release_single_cap(old_cap)
-        new_cap = _open_capture(cam_idx)
-        w, h, fps = self._get_target_res_and_fps()
-        opened = bool(new_cap and new_cap.isOpened())
-        if opened:
-            self._apply_single_cam_props(new_cap, w, h, fps)
-
-        with self.lock:
-            if not self.running:
-                self._release_single_cap(new_cap)
-                return
-            if is_left:
-                self.cap_left = new_cap
-                self.left_online = opened
-                self._left_fail_count = 0
-                if opened:
-                    self._last_left_time = now
-            else:
-                self.cap_right = new_cap
-                self.right_online = opened
-                self._right_fail_count = 0
-                if opened:
-                    self._last_right_time = now
-
-    def _poll_one_camera(self, side: str, now: float):
-        is_left = side == "left"
-        with self.lock:
-            cap = self.cap_left if is_left else self.cap_right
-
-        if cap is None or not cap.isOpened():
-            self._attempt_reconnect_side(side, now)
-            return
-
-        try:
-            ret, frame = cap.read()
-        except Exception:
-            ret, frame = False, None
-
-        if ret and frame is not None and frame.size > 0:
-            with self.lock:
-                if is_left:
-                    dt = now - self._last_left_time
-                    self._last_left_time = now
-                    self.latest_left = frame
-                    self.left_online = True
-                    self._left_fail_count = 0
-                    if dt > 0:
-                        self.fps_left = 0.85 * self.fps_left + 0.15 * (1.0 / dt)
-                else:
-                    dt = now - self._last_right_time
-                    self._last_right_time = now
-                    self.latest_right = frame
-                    self.right_online = True
-                    self._right_fail_count = 0
-                    if dt > 0:
-                        self.fps_right = 0.85 * self.fps_right + 0.15 * (1.0 / dt)
-            return
-
-        with self.lock:
-            if is_left:
-                self._left_fail_count += 1
-                fails = self._left_fail_count
-                self.fps_left = 0.0
-                if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
-                    self.left_online = False
-            else:
-                self._right_fail_count += 1
-                fails = self._right_fail_count
-                self.fps_right = 0.0
-                if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
-                    self.right_online = False
-
-        if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
-            self._attempt_reconnect_side(side, now)
 
     # ------------------------------------------------------------------
     # Stereo Calibration Mode, Capture & Pair Review
@@ -1125,12 +875,30 @@ class StereoCameraApp:
         return objp
 
     def capture_calibration_pair(self):
-        with self.lock:
-            frame_l = None if self.latest_left is None else self.latest_left.copy()
-            frame_r = None if self.latest_right is None else self.latest_right.copy()
+        snapshot = self.capture.get_synchronized_snapshot()
+        frame_l = snapshot["left_frame"]
+        frame_r = snapshot["right_frame"]
 
         if frame_l is None or frame_r is None:
-            messagebox.showwarning("No Frame", "Waiting for frames from both cameras.")
+            messagebox.showwarning(
+                "No Synchronized Frames",
+                "Waiting for recent, time-aligned frames from both cameras.",
+            )
+            return
+        size_l = (frame_l.shape[1], frame_l.shape[0])
+        size_r = (frame_r.shape[1], frame_r.shape[0])
+        if size_l != size_r:
+            messagebox.showerror(
+                "Camera Resolution Mismatch",
+                f"Stereo calibration requires equal frame sizes; got {size_l} and {size_r}.",
+            )
+            return
+        if self.image_size is not None and size_l != self.image_size:
+            messagebox.showerror(
+                "Calibration Resolution Changed",
+                f"Existing samples use {self.image_size}, but current cameras use {size_l}. "
+                "Start a new calibration after clearing or reviewing the old samples.",
+            )
             return
 
         cols = int(self.cols_var.get())
@@ -1154,7 +922,7 @@ class StereoCameraApp:
             return
 
         assert corners_l is not None and corners_r is not None
-        self.image_size = (gray_l.shape[1], gray_l.shape[0])
+        self.image_size = size_l
         self.captured_seq += 1
 
         idx_str = f"{self.captured_seq:03d}"
@@ -1375,13 +1143,6 @@ class StereoCameraApp:
     # ------------------------------------------------------------------
     # Video Capture & Live GUI Rendering
     # ------------------------------------------------------------------
-    def _capture_loop(self):
-        while self.running:
-            now = time.perf_counter()
-            self._poll_one_camera("left", now)
-            self._poll_one_camera("right", now)
-            time.sleep(0.005)
-
     def _compute_preview_bounds(self, widget: tk.Widget) -> Tuple[int, int]:
         """Clamp preview target bounds to the widget's allocated container size."""
         parent = widget.master
@@ -1426,13 +1187,13 @@ class StereoCameraApp:
         if not self.running:
             return
 
-        with self.lock:
-            frame_l = None if self.latest_left is None else self.latest_left.copy()
-            frame_r = None if self.latest_right is None else self.latest_right.copy()
-            fps_l = self.fps_left
-            fps_r = self.fps_right
-            online_l = self.left_online
-            online_r = self.right_online
+        snapshot = self.capture.get_snapshot(copy_frames=False)
+        frame_l = snapshot["left_frame"]
+        frame_r = snapshot["right_frame"]
+        fps_l = float(snapshot["fps_left"])
+        fps_r = float(snapshot["fps_right"])
+        online_l = bool(snapshot["left_online"])
+        online_r = bool(snapshot["right_online"])
 
         use_rect = self.rectification_ready and self.show_rectified_var.get()
         if use_rect:
@@ -1479,9 +1240,7 @@ class StereoCameraApp:
 
     def on_close(self):
         self.running = False
-        if hasattr(self, "capture_thread") and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=1.5)
-        self._release_cameras()
+        self.capture.close()
         self.root.destroy()
 
 

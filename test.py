@@ -8,6 +8,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from camera_manager import apply_camera_settings, open_capture
+
 # Enable Python & native fault tracebacks where supported
 faulthandler.enable(all_threads=True)
 
@@ -61,18 +63,18 @@ def test_cameras(left_idx: int, right_idx: int, settings_path: Path) -> bool:
 
     for label, idx in (("LEFT", left_idx), ("RIGHT", right_idx)):
         log(f"Opening {label} camera index {idx}...")
-        cap = vp._open_capture(idx)
+        cap = open_capture(idx)
         opened = bool(cap and cap.isOpened())
         log(f"{label} cam #{idx} isOpened={opened}")
-        if not opened:
-            if cap is not None:
-                cap.release()
+        if cap is None or not opened:
             log(f"FAIL: Could not open {label} camera #{idx}")
             return False
 
-        vp._apply_camera_settings(cap, settings)
-        ret, frame = cap.read()
-        cap.release()
+        try:
+            apply_camera_settings(cap, settings)
+            ret, frame = cap.read()
+        finally:
+            cap.release()
 
         if not ret or frame is None or frame.size == 0:
             log(f"FAIL: {label} cam #{idx} opened, but cap.read() returned no frame.")

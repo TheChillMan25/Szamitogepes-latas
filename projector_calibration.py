@@ -1,10 +1,5 @@
-import glob
 import json
 import os
-import re
-import threading
-import sys
-import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Dict, List, Optional, Tuple
@@ -13,6 +8,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from camera_manager import (
+    SingleThreadStereoCapture,
+    list_video_device_indices,
+)
 
 SETTINGS_FILE = "./camera_settings.json"
 CALIB_PARAMS_FILE = "./calibration_params.json"
@@ -37,83 +36,6 @@ ARUCO_DICTS = {
     "DICT_5X5_50": cv2.aruco.DICT_5X5_50,
     "DICT_6X6_50": cv2.aruco.DICT_6X6_50,
 }
-
-MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN = 5
-RECONNECT_BACKOFF_SEC = 0.6
-
-
-def _open_capture(idx: int) -> cv2.VideoCapture:
-    if sys.platform.startswith("win"):
-        for backend_name in ("CAP_DSHOW", "CAP_MSMF"):
-            if hasattr(cv2, backend_name):
-                cap = cv2.VideoCapture(idx, getattr(cv2, backend_name))
-                if cap is not None and cap.isOpened():
-                    return cap
-                if cap is not None:
-                    cap.release()
-        return cv2.VideoCapture(idx, getattr(cv2, "CAP_ANY", 0))
-
-    if hasattr(cv2, "CAP_V4L2"):
-        return cv2.VideoCapture(idx, cv2.CAP_V4L2)
-    return cv2.VideoCapture(idx)
-
-
-def list_video_device_indices(max_devices: int = 8) -> List[int]:
-    if not sys.platform.startswith("win"):
-        paths = sorted(glob.glob("/dev/video*"))
-        indices: List[int] = []
-        for p in paths:
-            m = re.search(r"(\d+)$", p)
-            if m:
-                idx = int(m.group(1))
-                if idx < max_devices and idx not in indices:
-                    indices.append(idx)
-        if indices:
-            return indices
-    return list(range(max_devices))
-
-
-def _apply_auto_exposure(cap: cv2.VideoCapture, enabled: bool):
-    if not hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
-        return
-    primary_val = 3 if enabled else 1
-    fallback_val = 0.75 if enabled else 0.25
-    if not cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, primary_val):
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, fallback_val)
-
-
-def probe_single_camera(idx: int, timeout_sec: float = 1.5) -> Optional[int]:
-    result: List[Optional[int]] = [None]
-
-    def _worker():
-        cap = _open_capture(idx)
-        try:
-            if cap.isOpened():
-                if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, int(timeout_sec * 1000))
-                if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(timeout_sec * 1000))
-                ret, frame = cap.read()
-                if ret and frame is not None and frame.size > 0:
-                    result[0] = idx
-        finally:
-            cap.release()
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=timeout_sec)
-    return result[0]
-
-
-def scan_available_cameras(max_devices: int = 8) -> List[int]:
-    candidates = list_video_device_indices(max_devices)
-    available = []
-    for idx in candidates:
-        found = probe_single_camera(idx, timeout_sec=1.5)
-        if found is not None:
-            available.append(found)
-    return available if available else candidates[:2]
-
 
 def get_aruco_detector(dict_name: str):
     dict_id = ARUCO_DICTS.get(dict_name, cv2.aruco.DICT_4X4_50)
@@ -150,6 +72,11 @@ def generate_projector_aruco_image(
     bottom-right, bottom-left) for display on the projector.
     Returns (image_bgr, marker_centers_px).
     """
+    if proj_w <= 0 or proj_h <= 0 or marker_px <= 0 or margin_px < 4:
+        raise ValueError("Projector dimensions, marker size, and margin must be positive.")
+    if proj_w <= 2 * (margin_px + marker_px) or proj_h <= 2 * (margin_px + marker_px):
+        raise ValueError("The four markers do not fit without overlapping.")
+
     dictionary, _ = get_aruco_detector(dict_name)
     canvas = np.full((proj_h, proj_w, 3), 255, dtype=np.uint8)
 
@@ -221,6 +148,183 @@ def triangulate_point_pair(
     return (pts4d[:3, 0] / w).astype(np.float64)
 
 
+def scale_camera_matrix(
+    camera_matrix: np.ndarray,
+    source_size: Tuple[int, int],
+    target_size: Tuple[int, int],
+) -> np.ndarray:
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    if min(source_width, source_height, target_width, target_height) <= 0:
+        raise ValueError("Camera image dimensions must be positive.")
+    scale = np.diag(
+        [
+            target_width / source_width,
+            target_height / source_height,
+            1.0,
+        ]
+    )
+    return scale @ camera_matrix
+
+
+def compute_projector_geometry(
+    marker_points_3d: Dict[int, np.ndarray],
+    projector_width: int,
+    projector_height: int,
+    marker_size_px: float,
+    margin_px: float,
+    known_width: float = 0.0,
+    known_height: float = 0.0,
+) -> dict:
+    if not {0, 1, 2, 3}.issubset(marker_points_3d):
+        raise ValueError("All four projector corner markers are required.")
+    if projector_width <= 0 or projector_height <= 0 or marker_size_px <= 0 or margin_px < 0:
+        raise ValueError("Projector dimensions, marker size, and margin must be valid.")
+
+    marker_points = {
+        marker_id: np.asarray(marker_points_3d[marker_id], dtype=np.float64).reshape(3)
+        for marker_id in range(4)
+    }
+    if not np.isfinite(np.vstack(list(marker_points.values()))).all():
+        raise ValueError("Triangulated projector markers must be finite.")
+
+    all_points = np.vstack([marker_points[marker_id] for marker_id in range(4)])
+    centroid = np.mean(all_points, axis=0)
+    centered = all_points - centroid
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    fitted_normal = vt[-1].astype(np.float64)
+    fitted_normal /= np.linalg.norm(fitted_normal)
+
+    u_raw = marker_points[1] - marker_points[0]
+    u_projected = u_raw - np.dot(u_raw, fitted_normal) * fitted_normal
+    u_length = float(np.linalg.norm(u_projected))
+    if u_length < 1e-8:
+        raise ValueError("Horizontal marker axis is degenerate.")
+    u_axis = u_projected / u_length
+
+    v_raw = marker_points[3] - marker_points[0]
+    v_projected = v_raw - np.dot(v_raw, fitted_normal) * fitted_normal
+    v_projected -= np.dot(v_projected, u_axis) * u_axis
+    v_length = float(np.linalg.norm(v_projected))
+    if v_length < 1e-8:
+        raise ValueError("Vertical marker axis is degenerate.")
+    v_axis = v_projected / v_length
+
+    plane_normal = np.cross(u_axis, v_axis)
+    normal_length = float(np.linalg.norm(plane_normal))
+    if normal_length < 1e-8:
+        raise ValueError("Projector plane axes are degenerate.")
+    plane_normal /= normal_length
+
+    center_x0 = margin_px + marker_size_px / 2.0
+    center_x1 = projector_width - margin_px - marker_size_px / 2.0
+    center_y0 = margin_px + marker_size_px / 2.0
+    center_y1 = projector_height - margin_px - marker_size_px / 2.0
+    if (
+        projector_width <= 2 * (margin_px + marker_size_px)
+        or projector_height <= 2 * (margin_px + marker_size_px)
+        or center_x1 <= center_x0
+        or center_y1 <= center_y0
+    ):
+        raise ValueError("ArUco markers overlap or do not fit inside the projector image.")
+
+    projector_marker_centers = np.array(
+        [
+            [center_x0, center_y0],
+            [center_x1, center_y0],
+            [center_x1, center_y1],
+            [center_x0, center_y1],
+        ],
+        dtype=np.float64,
+    )
+    marker_plane_coords = np.array(
+        [
+            [
+                np.dot(marker_points[mid] - marker_points[0], u_axis),
+                np.dot(marker_points[mid] - marker_points[0], v_axis),
+            ]
+            for mid in range(4)
+        ],
+        dtype=np.float64,
+    )
+    image_to_plane, _ = cv2.findHomography(
+        projector_marker_centers, marker_plane_coords, method=0
+    )
+    if image_to_plane is None or not np.isfinite(image_to_plane).all():
+        raise ValueError("Could not fit projector coordinate mapping.")
+
+    image_corners = np.array(
+        [
+            [
+                [0.0, 0.0],
+                [projector_width - 1.0, 0.0],
+                [projector_width - 1.0, projector_height - 1.0],
+                [0.0, projector_height - 1.0],
+            ]
+        ],
+        dtype=np.float64,
+    )
+    plane_corners_from_marker = cv2.perspectiveTransform(
+        image_corners, image_to_plane
+    )[0]
+    origin_marker = marker_points[0]
+    p_origin = (
+        origin_marker
+        + plane_corners_from_marker[0, 0] * u_axis
+        + plane_corners_from_marker[0, 1] * v_axis
+    )
+    plane_corners = plane_corners_from_marker - plane_corners_from_marker[0]
+    plane_to_pixel, _ = cv2.findHomography(
+        plane_corners.astype(np.float64), image_corners[0], method=0
+    )
+    if plane_to_pixel is None or not np.isfinite(plane_to_pixel).all():
+        raise ValueError("Could not fit inverse projector mapping.")
+
+    projector_corners_3d = np.array(
+        [
+            p_origin + point[0] * u_axis + point[1] * v_axis
+            for point in plane_corners
+        ],
+        dtype=np.float64,
+    )
+    width = 0.5 * (
+        np.linalg.norm(projector_corners_3d[1] - projector_corners_3d[0])
+        + np.linalg.norm(projector_corners_3d[2] - projector_corners_3d[3])
+    )
+    height = 0.5 * (
+        np.linalg.norm(projector_corners_3d[3] - projector_corners_3d[0])
+        + np.linalg.norm(projector_corners_3d[2] - projector_corners_3d[1])
+    )
+    if known_width > 0.0 and known_height <= 0.0:
+        height *= known_width / max(width, 1e-8)
+        width = known_width
+    elif known_height > 0.0 and known_width <= 0.0:
+        width *= known_height / max(height, 1e-8)
+        height = known_height
+    elif known_width > 0.0 and known_height > 0.0:
+        width, height = known_width, known_height
+
+    plane_coeffs = (
+        float(plane_normal[0]),
+        float(plane_normal[1]),
+        float(plane_normal[2]),
+        float(-np.dot(plane_normal, p_origin)),
+    )
+    plane_rms = float(np.sqrt(np.mean((centered @ plane_normal) ** 2)))
+    return {
+        "P_origin": p_origin,
+        "u_axis": u_axis,
+        "v_axis": v_axis,
+        "plane_normal": plane_normal,
+        "plane_coeffs": plane_coeffs,
+        "plane_to_pixel_homography": plane_to_pixel,
+        "projector_corners_3d": projector_corners_3d,
+        "width": float(width),
+        "height": float(height),
+        "plane_rms": plane_rms,
+    }
+
+
 class ProjectorCalibrationApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -231,23 +335,7 @@ class ProjectorCalibrationApp:
         self.stereo_params = self._load_stereo_params()
         self.proj_calib_result: Optional[dict] = self._load_existing_projector_calib()
 
-        self.lock = threading.Lock()
         self.running = True
-        self.cap_left: Optional[cv2.VideoCapture] = None
-        self.cap_right: Optional[cv2.VideoCapture] = None
-        self.latest_left: Optional[np.ndarray] = None
-        self.latest_right: Optional[np.ndarray] = None
-        self.left_online = False
-        self.right_online = False
-        self.fps_left = 0.0
-        self.fps_right = 0.0
-        self._last_left_time = time.perf_counter()
-        self._last_right_time = time.perf_counter()
-        self._left_fail_count = 0
-        self._right_fail_count = 0
-        self._last_left_reconnect_try = 0.0
-        self._last_right_reconnect_try = 0.0
-
         self._build_ui()
         self._apply_cam_settings_to_widgets()
         if self.proj_calib_result:
@@ -256,6 +344,12 @@ class ProjectorCalibrationApp:
         initial_cams = list_video_device_indices()
         self.left_cam_combo["values"] = initial_cams
         self.right_cam_combo["values"] = initial_cams
+        self.capture = SingleThreadStereoCapture(
+            settings=self.cam_settings,
+            left_idx=int(self.left_cam_var.get()),
+            right_idx=int(self.right_cam_var.get()),
+            on_scan_complete=self._on_camera_scan_complete,
+        )
 
         if self.stereo_params is None:
             self.status_var.set(
@@ -265,9 +359,6 @@ class ProjectorCalibrationApp:
             self.status_var.set(
                 f"Loaded stereo calibration from {CALIB_PARAMS_FILE}. Generate ArUco image or calibrate projector."
             )
-
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.capture_thread.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(50, self._async_initial_camera_setup)
@@ -435,13 +526,11 @@ class ProjectorCalibrationApp:
     # Camera Loop & Controls
     # ------------------------------------------------------------------
     def _async_initial_camera_setup(self):
-        def _worker():
-            cams = scan_available_cameras()
-            if not self.running:
-                return
-            self.root.after(0, lambda c=cams: self._on_initial_scan_done(c))
+        self.capture.request_scan()
 
-        threading.Thread(target=_worker, daemon=True).start()
+    def _on_camera_scan_complete(self, cams: List[int]):
+        if self.running:
+            self.root.after(0, lambda c=cams: self._on_initial_scan_done(c))
 
     def _on_initial_scan_done(self, cams: List[int]):
         if not self.running:
@@ -460,187 +549,13 @@ class ProjectorCalibrationApp:
 
     def _rescan_cameras(self):
         self.status_var.set("Rescanning cameras...")
-
-        def _worker():
-            cams = scan_available_cameras()
-            if not self.running:
-                return
-            self.root.after(0, lambda c=cams: self._on_rescan_done(c))
-
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _on_rescan_done(self, cams: List[int]):
-        if not self.running:
-            return
-        self.left_cam_combo["values"] = cams
-        self.right_cam_combo["values"] = cams
-        self.status_var.set(f"Detected cameras: {cams}")
-
-    def _release_single_cap(self, cap: Optional[cv2.VideoCapture]):
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
-
-    def _release_cameras(self):
-        with self.lock:
-            cap_l = self.cap_left
-            cap_r = self.cap_right
-            self.cap_left = None
-            self.cap_right = None
-            self.left_online = False
-            self.right_online = False
-        self._release_single_cap(cap_l)
-        self._release_single_cap(cap_r)
-
-    def _get_target_res_and_fps(self) -> Tuple[int, int, int]:
-        res_str = str(self.cam_settings.get("resolution", "1280x720"))
-        try:
-            w, h = [int(x) for x in res_str.split("x")]
-        except ValueError:
-            w, h = 1280, 720
-        return w, h, int(self.cam_settings.get("fps", 30))
-
-    def _apply_single_cam_props(self, cap: Optional[cv2.VideoCapture], width: int, height: int, fps: int):
-        if cap is None or not cap.isOpened():
-            return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-
-        autofocus = bool(self.cam_settings.get("autofocus", False))
-        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if autofocus else 0)
-        if not autofocus:
-            cap.set(cv2.CAP_PROP_FOCUS, int(self.cam_settings.get("focus", 0)))
-
-        auto_exp = bool(self.cam_settings.get("auto_exposure", True))
-        _apply_auto_exposure(cap, auto_exp)
-        if not auto_exp:
-            cap.set(cv2.CAP_PROP_EXPOSURE, float(self.cam_settings.get("exposure", -6)))
-
-        cap.set(cv2.CAP_PROP_BRIGHTNESS, float(self.cam_settings.get("brightness", 128)))
-        cap.set(cv2.CAP_PROP_CONTRAST, float(self.cam_settings.get("contrast", 128)))
+        self.capture.request_scan()
 
     def _open_selected_cameras(self):
-        self._release_cameras()
         left_idx = int(self.left_cam_var.get())
         right_idx = int(self.right_cam_var.get())
-        w, h, fps = self._get_target_res_and_fps()
-
-        cap_l = _open_capture(left_idx)
-        cap_r = _open_capture(right_idx)
-        if cap_l and cap_l.isOpened():
-            self._apply_single_cam_props(cap_l, w, h, fps)
-        if cap_r and cap_r.isOpened():
-            self._apply_single_cam_props(cap_r, w, h, fps)
-
-        with self.lock:
-            self.cap_left = cap_l
-            self.cap_right = cap_r
-            self.left_online = bool(cap_l and cap_l.isOpened())
-            self.right_online = bool(cap_r and cap_r.isOpened())
-            self._left_fail_count = 0
-            self._right_fail_count = 0
-
+        self.capture.set_indices(left_idx, right_idx)
         self.status_var.set(f"Opened Left Cam #{left_idx} and Right Cam #{right_idx}")
-
-    def _attempt_reconnect_side(self, side: str, now: float):
-        is_left = side == "left"
-        last_try = self._last_left_reconnect_try if is_left else self._last_right_reconnect_try
-        if now - last_try < RECONNECT_BACKOFF_SEC:
-            return
-
-        if is_left:
-            self._last_left_reconnect_try = now
-            cam_idx = int(self.left_cam_var.get())
-            old_cap = self.cap_left
-        else:
-            self._last_right_reconnect_try = now
-            cam_idx = int(self.right_cam_var.get())
-            old_cap = self.cap_right
-
-        self._release_single_cap(old_cap)
-        new_cap = _open_capture(cam_idx)
-        w, h, fps = self._get_target_res_and_fps()
-        opened = bool(new_cap and new_cap.isOpened())
-        if opened:
-            self._apply_single_cam_props(new_cap, w, h, fps)
-
-        with self.lock:
-            if not self.running:
-                self._release_single_cap(new_cap)
-                return
-            if is_left:
-                self.cap_left = new_cap
-                self.left_online = opened
-                self._left_fail_count = 0
-                if opened:
-                    self._last_left_time = now
-            else:
-                self.cap_right = new_cap
-                self.right_online = opened
-                self._right_fail_count = 0
-                if opened:
-                    self._last_right_time = now
-
-    def _poll_one_camera(self, side: str, now: float):
-        is_left = side == "left"
-        with self.lock:
-            cap = self.cap_left if is_left else self.cap_right
-
-        if cap is None or not cap.isOpened():
-            self._attempt_reconnect_side(side, now)
-            return
-
-        try:
-            ret, frame = cap.read()
-        except Exception:
-            ret, frame = False, None
-
-        if ret and frame is not None and frame.size > 0:
-            with self.lock:
-                if is_left:
-                    dt = now - self._last_left_time
-                    self._last_left_time = now
-                    self.latest_left = frame
-                    self.left_online = True
-                    self._left_fail_count = 0
-                    if dt > 0:
-                        self.fps_left = 0.85 * self.fps_left + 0.15 * (1.0 / dt)
-                else:
-                    dt = now - self._last_right_time
-                    self._last_right_time = now
-                    self.latest_right = frame
-                    self.right_online = True
-                    self._right_fail_count = 0
-                    if dt > 0:
-                        self.fps_right = 0.85 * self.fps_right + 0.15 * (1.0 / dt)
-            return
-
-        with self.lock:
-            if is_left:
-                self._left_fail_count += 1
-                fails = self._left_fail_count
-                self.fps_left = 0.0
-                if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
-                    self.left_online = False
-            else:
-                self._right_fail_count += 1
-                fails = self._right_fail_count
-                self.fps_right = 0.0
-                if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
-                    self.right_online = False
-
-        if fails >= MAX_CONSECUTIVE_FAILURES_BEFORE_REOPEN:
-            self._attempt_reconnect_side(side, now)
-
-    def _capture_loop(self):
-        while self.running:
-            now = time.perf_counter()
-            self._poll_one_camera("left", now)
-            self._poll_one_camera("right", now)
-            time.sleep(0.005)
 
     # ------------------------------------------------------------------
     # ArUco Pattern Generation & Projector Plane Calibration
@@ -657,6 +572,12 @@ class ProjectorCalibrationApp:
 
         if pw < 320 or ph < 240 or m_px < 40 or margin < 10:
             messagebox.showerror("Invalid Dimensions", "Please enter valid positive dimensions.")
+            return
+        if pw <= 2 * (margin + m_px) or ph <= 2 * (margin + m_px):
+            messagebox.showerror(
+                "Invalid Dimensions",
+                "The four markers must fit without overlapping inside the projector image.",
+            )
             return
 
         img_bgr, _centers = generate_projector_aruco_image(
@@ -706,12 +627,15 @@ class ProjectorCalibrationApp:
             )
             return
 
-        with self.lock:
-            frame_l = None if self.latest_left is None else self.latest_left.copy()
-            frame_r = None if self.latest_right is None else self.latest_right.copy()
+        snapshot = self.capture.get_synchronized_snapshot()
+        frame_l = snapshot["left_frame"]
+        frame_r = snapshot["right_frame"]
 
         if frame_l is None or frame_r is None:
-            messagebox.showwarning("No Frames", "Waiting for frames from both cameras.")
+            messagebox.showwarning(
+                "No Synchronized Frames",
+                "Waiting for recent, time-aligned frames from both cameras.",
+            )
             return
 
         dictionary, detector = get_aruco_detector(self.dict_var.get())
@@ -725,10 +649,11 @@ class ProjectorCalibrationApp:
         centers_r = self._extract_marker_centers_map(corners_r, ids_r)
 
         common_ids = sorted(set(centers_l.keys()) & set(centers_r.keys()))
-        if len(common_ids) < 3:
+        required_ids = {0, 1, 2, 3}
+        if not required_ids.issubset(common_ids):
             messagebox.showinfo(
-                "Not Enough Common Markers",
-                f"Need at least 3 ArUco markers detected in BOTH cameras.\n"
+                "Missing Projector Corner Markers",
+                f"All four projector corner markers {sorted(required_ids)} must be detected in BOTH cameras.\n"
                 f"Left IDs: {sorted(centers_l.keys())}, Right IDs: {sorted(centers_r.keys())}",
             )
             return
@@ -740,6 +665,20 @@ class ProjectorCalibrationApp:
             dist_r = np.array(self.stereo_params["dist_coeffs_right"], dtype=np.float64)
             R = np.array(self.stereo_params["R"], dtype=np.float64)
             T = np.array(self.stereo_params["T"], dtype=np.float64)
+            source_size = (
+                int(self.stereo_params["image_width"]),
+                int(self.stereo_params["image_height"]),
+            )
+            mtx_l = scale_camera_matrix(
+                mtx_l,
+                source_size,
+                (frame_l.shape[1], frame_l.shape[0]),
+            )
+            mtx_r = scale_camera_matrix(
+                mtx_r,
+                source_size,
+                (frame_r.shape[1], frame_r.shape[0]),
+            )
         except Exception as exc:
             messagebox.showerror("Invalid Stereo JSON", f"Failed reading stereo matrices:\n{exc}")
             return
@@ -751,110 +690,50 @@ class ProjectorCalibrationApp:
                     centers_l[mid], centers_r[mid], mtx_l, dist_l, mtx_r, dist_r, R, T
                 )
                 pts_3d_by_id[mid] = p3d
-            except Exception:
-                continue
+            except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+                messagebox.showerror(
+                    "Triangulation Failed",
+                    f"Could not triangulate marker {mid}: {exc}",
+                )
+                return
 
-        if len(pts_3d_by_id) < 3:
-            messagebox.showerror("Triangulation Failed", "Could not triangulate at least 3 common markers.")
+        if not required_ids.issubset(pts_3d_by_id):
+            messagebox.showerror(
+                "Triangulation Failed",
+                "All four projector corner markers must triangulate successfully.",
+            )
             return
 
-        all_pts = np.vstack(list(pts_3d_by_id.values()))  # (N, 3) in Left Camera frame
-
-        # Fit plane n . (X - X_mean) = 0 via SVD on centered 3D marker points[cite: 2]
-        centroid = np.mean(all_pts, axis=0)
-        centered = all_pts - centroid
-        _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
-        normal = vt[-1].astype(np.float64)
-        normal /= np.linalg.norm(normal)
-
-        # Orient normal toward the camera (-Z in typical camera coords, or toward camera origin)
-        if np.dot(normal, -centroid) < 0:
-            normal = -normal
-
-        # Compute horizontal (u_axis) and vertical (v_axis) unit vectors on the projector plane
-        # Prefer marker layout IDs: 0=TL, 1=TR, 2=BR, 3=BL when available
-        if 0 in pts_3d_by_id and 1 in pts_3d_by_id:
-            horiz_raw = pts_3d_by_id[1] - pts_3d_by_id[0]
-        elif 3 in pts_3d_by_id and 2 in pts_3d_by_id:
-            horiz_raw = pts_3d_by_id[2] - pts_3d_by_id[3]
-        else:
-            horiz_raw = centered[np.argmax(np.linalg.norm(centered, axis=1))]
-
-        # Project horizontal direction onto plane orthogonal to normal
-        horiz_proj = horiz_raw - np.dot(horiz_raw, normal) * normal
-        if np.linalg.norm(horiz_proj) < 1e-9:
-            horiz_proj = vt[0] - np.dot(vt[0], normal) * normal
-        u_axis = horiz_proj / np.linalg.norm(horiz_proj)
-
-        # Vertical unit vector pointing downward in projector/screen coordinates (u x n or orthogonalized 0->3)
-        if 0 in pts_3d_by_id and 3 in pts_3d_by_id:
-            vert_raw = pts_3d_by_id[3] - pts_3d_by_id[0]
-            vert_proj = vert_raw - np.dot(vert_raw, normal) * normal
-            # Remove any slight non-orthogonality with u_axis
-            vert_proj = vert_proj - np.dot(vert_proj, u_axis) * u_axis
-            if np.linalg.norm(vert_proj) > 1e-9:
-                v_axis = vert_proj / np.linalg.norm(vert_proj)
-            else:
-                v_axis = np.cross(normal, u_axis)
-        else:
-            v_axis = np.cross(normal, u_axis)
-        v_axis = v_axis / np.linalg.norm(v_axis)
-
-        # Recompute orthonormal plane normal n = u_axis x v_axis (or right-handed basis)
-        plane_normal = np.cross(u_axis, v_axis)
-        plane_normal /= np.linalg.norm(plane_normal)
-        if np.dot(plane_normal, normal) < 0:
-            v_axis = -v_axis
-            plane_normal = -plane_normal
-
-        # Project all 3D points onto (u_axis, v_axis) to find span & top-left origin P_origin
-        proj_u = centered @ u_axis
-        proj_v = centered @ v_axis
-
-        min_u, max_u = float(np.min(proj_u)), float(np.max(proj_u))
-        min_v, max_v = float(np.min(proj_v)), float(np.max(proj_v))
-
-        # Adjust span for marker center offset if all 4 corner markers (0,1,2,3) were used
         proj_w = int(self.proj_w_var.get())
         proj_h = int(self.proj_h_var.get())
         m_px = float(self.marker_px_var.get())
         margin_px = float(self.margin_px_var.get())
-        center_span_x_px = max(1.0, (proj_w - margin_px - m_px / 2.0) - (margin_px + m_px / 2.0))
-        center_span_y_px = max(1.0, (proj_h - margin_px - m_px / 2.0) - (margin_px + m_px / 2.0))
-
-        measured_span_u = max(1e-6, max_u - min_u)
-        measured_span_v = max(1e-6, max_v - min_v)
-
-        # Full projected width/height scale factor from marker-center span to full projector image
-        scale_u = proj_w / center_span_x_px if len(common_ids) >= 2 else 1.0
-        scale_v = proj_h / center_span_y_px if len(common_ids) >= 2 else 1.0
-
-        width_units = measured_span_u * scale_u
-        height_units = measured_span_v * scale_v
-
         known_w = float(self.known_w_mm_var.get())
         known_h = float(self.known_h_mm_var.get())
-        if known_w > 0.0:
-            width_units = known_w
-        if known_h > 0.0:
-            height_units = known_h
+        try:
+            geometry = compute_projector_geometry(
+                pts_3d_by_id,
+                proj_w,
+                proj_h,
+                m_px,
+                margin_px,
+                known_width=known_w,
+                known_height=known_h,
+            )
+        except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+            messagebox.showerror("Invalid Projector Geometry", str(exc))
+            return
 
-        # Top-left origin of the calibrated projector plane in Left Camera coordinates
-        p_origin = centroid + min_u * u_axis + min_v * v_axis
-        if known_w > 0.0 and 0 in pts_3d_by_id:
-            p_origin = pts_3d_by_id[0]
-        elif known_w > 0.0 and known_h <= 0.0:
-            height_units = width_units * (proj_h / max(1, proj_w))
-        elif known_h > 0.0 and known_w <= 0.0:
-            width_units = height_units * (proj_w / max(1, proj_h))
-
-        # Plane equation: a*x + b*y + c*z + d = 0
-        a, b, c = [float(x) for x in plane_normal]
-        d = float(-np.dot(plane_normal, p_origin))
-
-        # Plane fit RMS residual in 3D units
-        residuals = np.abs(centered @ plane_normal)
-        plane_rms = float(np.sqrt(np.mean(residuals ** 2)))
+        p_origin = geometry["P_origin"]
+        u_axis = geometry["u_axis"]
+        v_axis = geometry["v_axis"]
+        plane_normal = geometry["plane_normal"]
+        a, b, c, d = geometry["plane_coeffs"]
+        plane_to_pixel = geometry["plane_to_pixel_homography"]
+        projector_corners_3d = geometry["projector_corners_3d"]
+        width_units = geometry["width"]
+        height_units = geometry["height"]
+        plane_rms = geometry["plane_rms"]
 
         output_data = {
             "coordinate_frame": "left_camera",
@@ -868,6 +747,8 @@ class ProjectorCalibrationApp:
             "P_origin": [float(x) for x in p_origin],
             "u_axis": [float(x) for x in u_axis],
             "v_axis": [float(x) for x in v_axis],
+            "plane_to_pixel_homography": plane_to_pixel.tolist(),
+            "projector_corners_3d": projector_corners_3d.tolist(),
             "normal": [a, b, c],
             "plane_coeffs": {"a": a, "b": b, "c": c, "d": d},
             "plane_fit_rms": plane_rms,
@@ -933,13 +814,13 @@ class ProjectorCalibrationApp:
         if not self.running:
             return
 
-        with self.lock:
-            frame_l = None if self.latest_left is None else self.latest_left.copy()
-            frame_r = None if self.latest_right is None else self.latest_right.copy()
-            fps_l = self.fps_left
-            fps_r = self.fps_right
-            online_l = self.left_online
-            online_r = self.right_online
+        snapshot = self.capture.get_snapshot(copy_frames=False)
+        frame_l = snapshot["left_frame"]
+        frame_r = snapshot["right_frame"]
+        fps_l = float(snapshot["fps_left"])
+        fps_r = float(snapshot["fps_right"])
+        online_l = bool(snapshot["left_online"])
+        online_r = bool(snapshot["right_online"])
 
         dictionary, detector = get_aruco_detector(self.dict_var.get())
 
@@ -961,9 +842,7 @@ class ProjectorCalibrationApp:
 
     def on_close(self):
         self.running = False
-        if hasattr(self, "capture_thread") and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=1.5)
-        self._release_cameras()
+        self.capture.close()
         self.root.destroy()
 
 
